@@ -54,8 +54,18 @@ export async function POST(req: NextRequest) {
       },
     });
     let postsCreated = 0;
-    if (fetchRecent) { try { const r = await syncCreatorPosts(creator); postsCreated = r.created; } catch {} }
-    return NextResponse.json(serializeBigInt({ creator, postsCreated }), { status: 201 });
+    let postsChecked = 0;
+    let syncError: string | null = null;
+    if (fetchRecent) {
+      try {
+        const r = await syncCreatorPosts(creator);
+        postsCreated = r.created;
+        postsChecked = r.checked;
+      } catch (err: any) {
+        syncError = err.message ?? "Initial post fetch failed.";
+      }
+    }
+    return NextResponse.json(serializeBigInt({ creator, postsCreated, postsChecked, syncError }), { status: 201 });
   } catch (err: any) {
     return NextResponse.json({ error: err.message ?? "Failed to add creator." }, { status: 500 });
   }

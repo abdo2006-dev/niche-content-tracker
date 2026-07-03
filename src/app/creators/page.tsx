@@ -69,7 +69,7 @@ export default function CreatorsPage() {
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div><h1 className="text-xl font-semibold text-white">Creators</h1><p className="text-sm text-muted">{creators.length} tracked</p></div>
+      <div><h1 className="text-xl font-semibold text-white">Creators</h1><p className="text-sm text-muted">{creators.length} tracked · new creators fetch up to 14 days of posts</p></div>
         <div className="flex gap-2">
           <select value={filterPlatform} onChange={e=>setFilterPlatform(e.target.value)} className="input">
             <option value="">All platforms</option>
@@ -151,6 +151,11 @@ function AddCreatorForm({ onClose, onAdded }: { onClose: ()=>void; onAdded: ()=>
     const data = await readResponse(res); setLoading(false);
     if (!res.ok) { setError(data?.error ?? "Failed to add."); return; }
     onAdded(); onClose();
+    if (fetchRecent) {
+      if (data?.syncError) alert("Creator added, but initial post fetch failed: " + data.syncError);
+      else if ((data?.postsChecked ?? 0) === 0) alert("Creator added, but no public posts were found in the recent fetch window.");
+      else alert("Creator added. Fetched " + (data?.postsCreated ?? 0) + " new post(s) from " + (data?.postsChecked ?? 0) + " recent post(s).");
+    }
   }
 
   return (

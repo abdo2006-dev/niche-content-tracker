@@ -99,13 +99,15 @@ export async function syncCreatorPosts(creator: Creator, max = DEFAULT_CREATOR_S
   }
 
   const latestStub = stubs[0];
-  await prisma.creator.update({
-    where: { id: creator.id },
-    data: {
-      lastSyncedAt: new Date(),
-      lastPostAt: latestStub ? new Date(latestStub.publishedAt) : creator.lastPostAt,
-    },
-  });
+  if (latestStub) {
+    await prisma.creator.update({
+      where: { id: creator.id },
+      data: {
+        lastSyncedAt: new Date(),
+        lastPostAt: new Date(latestStub.publishedAt),
+      },
+    });
+  }
 
   return { checked: stubs.length, created };
 }
