@@ -99,6 +99,25 @@ function tiktokItemToPost(item: any, fallbackId: string): ResolvedPost | null {
   };
 }
 
+function stubsFromProfileData(data: any, max: number): PostStub[] {
+  const scope = data["__DEFAULT_SCOPE__"] ?? {};
+  const itemList =
+    scope["webapp.user-detail"]?.itemList ??
+    scope["webapp.user-detail"]?.userInfo?.itemList ??
+    [];
+  const cutoff = cutoffDate();
+  const videoItems: PostStub[] = [];
+
+  for (const item of itemList) {
+    const stub = toPostStub(item);
+    if (!stub || new Date(stub.publishedAt) < cutoff) continue;
+    tiktokItemCache.set(stub.platformId, item);
+    videoItems.push(stub);
+  }
+
+  return videoItems.slice(0, max);
+}
+
 function clean(username: string): string {
   // Accept: @username, username, https://tiktok.com/@username, tiktok.com/@username
   const t = username.trim();
@@ -180,20 +199,8 @@ export async function fetchTikTokRecentPosts(username: string, max = 120): Promi
   const secUid = user?.secUid;
 
   if (!secUid) {
-    // Fall back: try to extract some videos that may be embedded in the page HTML
-    const videoItems: PostStub[] = [];
-    const itemList = scope["webapp.user-detail"]?.itemList ?? [];
-    for (const item of itemList) {
-      if (item?.id && item?.createTime) {
-        const stub = toPostStub(item);
-        if (stub) {
-          tiktokItemCache.set(stub.platformId, item);
-          videoItems.push(stub);
-        }
-      }
-    }
-    const cutoff = cutoffDate();
-    return videoItems.filter((item) => new Date(item.publishedAt) >= cutoff).slice(0, max);
+    // Fall back: try to extract videos embedded in the page HTML.
+    return stubsFromProfileData(data, max);
   }
 
   const cutoff = cutoffDate();
@@ -216,7 +223,19 @@ export async function fetchTikTokRecentPosts(username: string, max = 120): Promi
     await log("api/post/item_list");
 
     if (!res.ok) throw new Error(`TikTok video list failed (${res.status})`);
-    const json = await res.json();
+    const text = await res.text();
+    if (!text.trim()) {
+      if (results.length) break;
+      return stubsFromProfileData(data, max);
+    }
+
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      if (results.length) break;
+      return stubsFromProfileData(data, max);
+    }
     const items: any[] = json.itemList ?? [];
     if (!items.length) break;
 
