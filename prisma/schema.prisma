@@ -1,0 +1,208 @@
+// Content Tracker — platform-agnostic schema for YouTube, TikTok, and Instagram.
+// Run: npx prisma migrate dev  (or npx prisma db push for a quick fresh setup)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  YOUTUBE
+  TIKTOK
+  INSTAGRAM
+}
+
+enum MediaType {
+  VIDEO
+  IMAGE
+  CAROUSEL
+}
+
+enum PostSource {
+  CREATOR_SYNC
+  KEYWORD_SEARCH
+}
+
+// Platform-agnostic "channel" — works for YouTube channels, TikTok accounts, Instagram profiles.
+model Creator {
+  id            String    @id @default(cuid())
+  platform      Platform
+  platformId    String    // YouTube channelId / TikTok open_id / Instagram user_id
+  username      String    // @handle
+  displayName   String
+  profileUrl    String
+  avatarUrl     String?
+  bio           String?
+  followerCount BigInt?   // subs / followers / fans — null when hidden
+  platformMeta  Json?     // platform extras e.g. { uploadsPlaylistId, secUid }
+
+  lastSyncedAt DateTime?
+  lastPostAt   DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  posts Post[]
+  tags  CreatorTag[]
+
+  @@unique([platform, platformId])
+  @@index([platform])
+  @@index([lastSyncedAt])
+}
+
+// Platform-agnostic "video" — YouTube video, TikTok, Instagram Reel/post.
+model Post {
+  id              String     @id @default(cuid())
+  platform        Platform
+  platformId      String     @unique // YouTube videoId / TikTok video_id / Instagram media_id
+  title           String?    // YouTube title / Instagram caption / TikTok description
+  description     String?    // excerpt max 300 chars
+  publishedAt     DateTime
+  thumbnailUrl    String?
+  durationSeconds Int?
+  isShort         Boolean    @default(false)
+  url             String
+  mediaType       MediaType  @default(VIDEO)
+
+  creatorId String?
+  creator   Creator? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+
+  // Latest stats (denormalized for fast sort/filter)
+  viewCount    BigInt @default(0)
+  likeCount    BigInt @default(0)
+  commentCount BigInt @default(0)
+  shareCount   BigInt @default(0)
+  saveCount    BigInt @default(0)
+
+  // Growth metrics, recalculated on each stats update
+  vph            Float?
+  viewsGained24h BigInt? @default(0)
+  viewsGained7d  BigInt? @default(0)
+  viewsGained30d BigInt? @default(0)
+
+  lastStatsUpdateAt DateTime?
+  source            PostSource @default(CREATOR_SYNC)
+  platformMeta      Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tags           PostTag[]
+  statsSnapshots PostStatsSnapshot[]
+  keywordPosts   KeywordTrackerPost[]
+  ideaNotes      IdeaNote[]
+
+  @@index([publishedAt])
+  @@index([platform])
+  @@index([viewCount])
+  @@index([vph])
+  @@index([creatorId])
+}
+
+model PostStatsSnapshot {
+  id           String   @id @default(cuid())
+  postId       String
+  post         Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  viewCount    BigInt
+  likeCount    BigInt
+  commentCount BigInt
+  shareCount   BigInt   @default(0)
+  saveCount    BigInt   @default(0)
+  capturedAt   DateTime @default(now())
+
+  @@index([postId, capturedAt])
+}
+
+model Tag {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  color     String?  @default("#34d399")
+  createdAt DateTime @default(now())
+
+  creatorTags CreatorTag[]
+  postTags    PostTag[]
+  keywordTags KeywordTrackerTag[]
+}
+
+model CreatorTag {
+  creatorId String
+  tagId     String
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([creatorId, tagId])
+}
+
+model PostTag {
+  postId String
+  tagId  String
+  post   Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag    Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+}
+
+model KeywordTracker {
+  id            String     @id @default(cuid())
+  query         String
+  platforms     Platform[]
+  shortsOnly    Boolean    @default(false)
+  active        Boolean    @default(true)
+  maxAgeDays    Int        @default(30)
+  lastFetchedAt DateTime?
+  createdAt     DateTime   @default(now())
+
+  posts KeywordTrackerPost[]
+  tags  KeywordTrackerTag[]
+
+  @@unique([query, shortsOnly])
+}
+
+model KeywordTrackerTag {
+  keywordTrackerId String
+  tagId            String
+  keywordTracker   KeywordTracker @relation(fields: [keywordTrackerId], references: [id], onDelete: Cascade)
+  tag              Tag            @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([keywordTrackerId, tagId])
+}
+
+model KeywordTrackerPost {
+  keywordTrackerId String
+  postId           String
+  addedAt          DateTime @default(now())
+  expired          Boolean  @default(false)
+
+  keywordTracker KeywordTracker @relation(fields: [keywordTrackerId], references: [id], onDelete: Cascade)
+  post           Post           @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@id([keywordTrackerId, postId])
+}
+
+model IdeaNote {
+  id        String   @id @default(cuid())
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  content   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AppSetting {
+  key   String @id
+  value String
+}
+
+model ApiUsageLog {
+  id        String   @id @default(cuid())
+  platform  Platform
+  endpoint  String
+  units     Int
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([platform])
+}
