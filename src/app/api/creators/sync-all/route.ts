@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { syncCreatorPosts } from "@/lib/sync";
 import { checkRefreshAllowed } from "@/lib/quota";
+
+export const dynamic = "force-dynamic";
 export async function POST() {
   const creators = await prisma.creator.findMany();
   const results = [];

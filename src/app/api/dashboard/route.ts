@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { serializeBigInt } from "@/lib/serialize";
+
+export const dynamic = "force-dynamic";
 export async function GET(req: NextRequest) {
   const range = new URL(req.url).searchParams.get("range") ?? "week";
   const now = new Date();

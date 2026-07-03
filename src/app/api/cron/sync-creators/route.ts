@@ -4,6 +4,8 @@ import { syncCreatorPosts } from "@/lib/sync";
 import { checkRefreshAllowed } from "@/lib/quota";
 import { verifyCronRequest } from "@/lib/cronAuth";
 import { getSetting } from "@/lib/settings";
+
+export const dynamic = "force-dynamic";
 export async function GET(req: NextRequest) {
   const u = verifyCronRequest(req); if (u) return u;
   if ((await getSetting("cronEnabled")) === "false") return NextResponse.json({ skipped: true });

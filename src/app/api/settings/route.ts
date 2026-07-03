@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAllSettings, setSetting } from "@/lib/settings";
 import { updateSettingSchema } from "@/lib/validations";
+
+export const dynamic = "force-dynamic";
 export async function GET() {
   return NextResponse.json({
     ...(await getAllSettings()),

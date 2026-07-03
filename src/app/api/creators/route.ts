@@ -5,6 +5,8 @@ import { syncCreatorPosts } from "@/lib/sync";
 import { addCreatorSchema } from "@/lib/validations";
 import { serializeBigInt } from "@/lib/serialize";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sort = searchParams.get("sort") ?? "lastPost";

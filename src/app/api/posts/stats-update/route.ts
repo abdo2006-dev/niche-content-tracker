@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
 import { updatePostStats } from "@/lib/sync";
 import { getSetting } from "@/lib/settings";
 
+export const dynamic = "force-dynamic";
+
 export async function POST() {
   const intervalHours = Number(await getSetting("refreshInterval_statsUpdate")) || 2;
   const cutoff = new Date(Date.now() - intervalHours * 3600000);

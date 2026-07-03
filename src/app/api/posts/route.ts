@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
 import { serializeBigInt } from "@/lib/serialize";
 import type { Prisma } from "@prisma/client";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const platform = searchParams.get("platform");

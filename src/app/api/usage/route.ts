@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+
+export const dynamic = "force-dynamic";
 export async function GET() {
   const since24h = new Date(Date.now() - 86400000);
   const [logs, total] = await Promise.all([

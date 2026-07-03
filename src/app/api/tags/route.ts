@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createTagSchema } from "@/lib/validations";
+
+export const dynamic = "force-dynamic";
 export async function GET() {
   const tags = await prisma.tag.findMany({ orderBy: { name: "asc" }, include: { _count: { select: { creatorTags: true, postTags: true, keywordTags: true } } } });
   return NextResponse.json(tags);

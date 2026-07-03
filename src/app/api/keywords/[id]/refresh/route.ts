@@ -4,6 +4,8 @@ import { refreshKeywordTracker } from "@/lib/sync";
 import { checkRefreshAllowed } from "@/lib/quota";
 import { getSetting } from "@/lib/settings";
 import { serializeBigInt } from "@/lib/serialize";
+
+export const dynamic = "force-dynamic";
 export async function POST(_req: NextRequest, { params }: { params: { id: string } }) {
   const tracker = await prisma.keywordTracker.findUnique({ where: { id: params.id } });
   if (!tracker) return NextResponse.json({ error: "Tracker not found." }, { status: 404 });

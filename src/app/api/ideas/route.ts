@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { serializeBigInt } from "@/lib/serialize";
+
+export const dynamic = "force-dynamic";
 export async function GET() {
   const since30d = new Date(Date.now() - 30 * 86400000);
   const since7d = new Date(Date.now() - 7 * 86400000);

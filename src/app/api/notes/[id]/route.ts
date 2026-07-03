@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { z } from "zod";
+
+export const dynamic = "force-dynamic";
 const schema = z.object({ content: z.string().min(1).max(2000) });
 export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
   const parsed = schema.safeParse(await req.json());

@@ -3,6 +3,8 @@ import { prisma } from "@/lib/prisma";
 import { updatePostStats } from "@/lib/sync";
 import { getSetting } from "@/lib/settings";
 import { verifyCronRequest } from "@/lib/cronAuth";
+
+export const dynamic = "force-dynamic";
 export async function GET(req: NextRequest) {
   const u = verifyCronRequest(req); if (u) return u;
   if ((await getSetting("cronEnabled")) === "false") return NextResponse.json({ skipped: true });

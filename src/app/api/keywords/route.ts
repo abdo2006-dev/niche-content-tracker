@@ -4,6 +4,8 @@ import { createKeywordTrackerSchema } from "@/lib/validations";
 import { refreshKeywordTracker } from "@/lib/sync";
 import { getSetting } from "@/lib/settings";
 import { serializeBigInt } from "@/lib/serialize";
+
+export const dynamic = "force-dynamic";
 export async function GET() {
   const trackers = await prisma.keywordTracker.findMany({
     where: { active: true }, orderBy: { createdAt: "desc" },
