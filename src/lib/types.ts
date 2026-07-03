@@ -17,6 +17,7 @@ export interface ResolvedCreator {
 export interface PostStub {
   platformId: string;
   publishedAt: string; // ISO 8601
+  raw?: unknown;
 }
 
 /** Full post details returned after fetching a batch of posts. */

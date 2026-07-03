@@ -41,12 +41,62 @@ const API_HEADERS = {
   Referer: "https://www.tiktok.com/",
 };
 
+const RECENT_LOOKBACK_DAYS = 14;
+const MAX_TIKTOK_PAGES = 6;
+const tiktokItemCache = new Map<string, any>();
+
 async function log(endpoint: string) {
   try {
     await prisma.apiUsageLog.create({
       data: { platform: "TIKTOK", endpoint, units: 1 },
     });
   } catch {}
+}
+
+function cutoffDate(days = RECENT_LOOKBACK_DAYS) {
+  return new Date(Date.now() - days * 86_400_000);
+}
+
+function toPostStub(item: any): PostStub | null {
+  if (!item?.id || !item?.createTime) return null;
+  return {
+    platformId: String(item.id),
+    publishedAt: new Date(Number(item.createTime) * 1000).toISOString(),
+    raw: item,
+  };
+}
+
+function tiktokItemToPost(item: any, fallbackId: string): ResolvedPost | null {
+  if (!item) return null;
+  const id = String(item.id ?? fallbackId);
+  const video = item.video ?? {};
+  const stats = item.stats ?? item.statsV2 ?? {};
+  const author = item.author ?? {};
+  const desc = (item.desc ?? "").slice(0, 300);
+  const dur = Number(video.duration ?? 0);
+
+  return {
+    platform: "TIKTOK",
+    platformId: id,
+    title: desc.slice(0, 200) || null,
+    description: desc || null,
+    publishedAt: new Date(Number(item.createTime ?? 0) * 1000).toISOString(),
+    thumbnailUrl: video.cover ?? video.dynamicCover ?? null,
+    durationSeconds: dur,
+    isShort: true,
+    url: `https://www.tiktok.com/@${author.uniqueId ?? "unknown"}/video/${id}`,
+    mediaType: "VIDEO",
+    viewCount: BigInt(stats.playCount ?? stats.viewCount ?? 0),
+    likeCount: BigInt(stats.diggCount ?? stats.likeCount ?? 0),
+    commentCount: BigInt(stats.commentCount ?? 0),
+    shareCount: BigInt(stats.shareCount ?? 0),
+    saveCount: BigInt(stats.collectCount ?? 0),
+    platformMeta: {
+      hashtags: (item.textExtra ?? [])
+        .filter((t: any) => t.hashtagName)
+        .map((t: any) => t.hashtagName as string),
+    },
+  };
 }
 
 function clean(username: string): string {
@@ -120,7 +170,7 @@ export async function resolveTikTokCreator(input: string): Promise<ResolvedCreat
 
 // --- Recent posts -----------------------------------------------------------
 
-export async function fetchTikTokRecentPosts(username: string, max = 30): Promise<PostStub[]> {
+export async function fetchTikTokRecentPosts(username: string, max = 120): Promise<PostStub[]> {
   // First get secUid from the profile page (it's embedded in the HTML)
   const data = await parsePageData(`https://www.tiktok.com/@${username}`);
   await log("scrape/@username");
@@ -135,37 +185,59 @@ export async function fetchTikTokRecentPosts(username: string, max = 30): Promis
     const itemList = scope["webapp.user-detail"]?.itemList ?? [];
     for (const item of itemList) {
       if (item?.id && item?.createTime) {
-        videoItems.push({
-          platformId: String(item.id),
-          publishedAt: new Date(item.createTime * 1000).toISOString(),
-        });
+        const stub = toPostStub(item);
+        if (stub) {
+          tiktokItemCache.set(stub.platformId, item);
+          videoItems.push(stub);
+        }
       }
     }
-    return videoItems.slice(0, max);
+    const cutoff = cutoffDate();
+    return videoItems.filter((item) => new Date(item.publishedAt) >= cutoff).slice(0, max);
   }
 
-  // Use TikTok's internal mobile API — the same one the web app calls
-  const params = new URLSearchParams({
-    aid: "1988",
-    count: String(Math.min(max, 35)),
-    secUid,
-    cursor: "0",
-    sourceType: "8",
-    appId: "1233",
-  });
+  const cutoff = cutoffDate();
+  const results: PostStub[] = [];
+  let cursor = "0";
 
-  const res = await fetch(`https://m.tiktok.com/api/post/item_list/?${params}`, {
-    headers: API_HEADERS,
-  });
-  await log("api/post/item_list");
+  for (let page = 0; page < MAX_TIKTOK_PAGES && results.length < max; page++) {
+    const params = new URLSearchParams({
+      aid: "1988",
+      count: String(Math.min(35, max - results.length)),
+      secUid,
+      cursor,
+      sourceType: "8",
+      appId: "1233",
+    });
 
-  if (!res.ok) throw new Error(`TikTok video list failed (${res.status})`);
-  const json = await res.json();
+    const res = await fetch(`https://m.tiktok.com/api/post/item_list/?${params}`, {
+      headers: API_HEADERS,
+    });
+    await log("api/post/item_list");
 
-  return (json.itemList ?? []).map((item: any): PostStub => ({
-    platformId: String(item.id),
-    publishedAt: new Date((item.createTime ?? 0) * 1000).toISOString(),
-  }));
+    if (!res.ok) throw new Error(`TikTok video list failed (${res.status})`);
+    const json = await res.json();
+    const items: any[] = json.itemList ?? [];
+    if (!items.length) break;
+
+    let reachedOlderPosts = false;
+    for (const item of items) {
+      const stub = toPostStub(item);
+      if (!stub) continue;
+      tiktokItemCache.set(stub.platformId, item);
+      if (new Date(stub.publishedAt) < cutoff) {
+        reachedOlderPosts = true;
+        continue;
+      }
+      results.push(stub);
+      if (results.length >= max) break;
+    }
+
+    if (reachedOlderPosts || !json.hasMore) break;
+    cursor = String(json.cursor ?? items[items.length - 1]?.createTime ?? cursor);
+  }
+
+  return results.slice(0, max);
 }
 
 // --- Video details ----------------------------------------------------------
@@ -176,6 +248,12 @@ export async function fetchTikTokPostDetails(videoIds: string[]): Promise<Resolv
 
   for (const id of videoIds) {
     try {
+      const cached = tiktokItemToPost(tiktokItemCache.get(id), id);
+      if (cached) {
+        results.push(cached);
+        continue;
+      }
+
       // Scrape the individual video page — stats are embedded in the HTML
       // We use a short URL which redirects to the full canonical URL
       const data = await parsePageData(`https://www.tiktok.com/video/${id}`);
@@ -190,33 +268,8 @@ export async function fetchTikTokPostDetails(videoIds: string[]): Promise<Resolv
       const item = videoDetail ?? scope["webapp.video-detail"]?.itemInfo;
       if (!item) continue;
 
-      const video = item.video ?? {};
-      const stats = item.stats ?? {};
-      const desc = (item.desc ?? "").slice(0, 300);
-      const dur = Number(video.duration ?? 0);
-
-      results.push({
-        platform: "TIKTOK",
-        platformId: String(item.id ?? id),
-        title: desc.slice(0, 200) || null,
-        description: desc || null,
-        publishedAt: new Date((item.createTime ?? 0) * 1000).toISOString(),
-        thumbnailUrl: video.cover ?? video.dynamicCover ?? null,
-        durationSeconds: dur,
-        isShort: true, // TikToks are always short-form
-        url: `https://www.tiktok.com/@${item.author?.uniqueId ?? "unknown"}/video/${item.id ?? id}`,
-        mediaType: "VIDEO",
-        viewCount: BigInt(stats.playCount ?? stats.viewCount ?? 0),
-        likeCount: BigInt(stats.diggCount ?? stats.likeCount ?? 0),
-        commentCount: BigInt(stats.commentCount ?? 0),
-        shareCount: BigInt(stats.shareCount ?? 0),
-        saveCount: BigInt(stats.collectCount ?? 0),
-        platformMeta: {
-          hashtags: (item.textExtra ?? [])
-            .filter((t: any) => t.hashtagName)
-            .map((t: any) => t.hashtagName as string),
-        },
-      });
+      const post = tiktokItemToPost(item, id);
+      if (post) results.push(post);
     } catch {
       // Individual video may be deleted/private — skip it
     }

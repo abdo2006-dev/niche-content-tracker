@@ -15,6 +15,16 @@ const PLATFORMS = [
   { value: "INSTAGRAM", label: "Instagram", hint: "Profile URL (instagram.com/name) or @username" },
 ];
 
+async function readResponse(res: Response) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text.slice(0, 300) };
+  }
+}
+
 export default function CreatorsPage() {
   const [creators, setCreators] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -29,16 +39,23 @@ export default function CreatorsPage() {
   function load() {
     setLoading(true);
     const p = new URLSearchParams({ sort, ...(filterPlatform && { platform: filterPlatform }) });
-    fetch("/api/creators?" + p).then(r=>r.json()).then(d=>{setCreators(d);setLoading(false);}).catch(()=>{setError("Failed.");setLoading(false);});
+    fetch("/api/creators?" + p)
+      .then(async (r) => {
+        const d = await readResponse(r);
+        if (!r.ok) throw new Error(d?.error ?? "Failed to load creators.");
+        return d;
+      })
+      .then(d=>{setCreators(Array.isArray(d) ? d : []);setLoading(false);})
+      .catch((err)=>{setError(err.message ?? "Failed.");setLoading(false);});
   }
   useEffect(()=>{load();},[sort, filterPlatform]);
 
   async function sync(id: string) {
     setSyncing(id);
     const res = await fetch("/api/creators/" + id + "/sync", { method: "POST" });
-    const d = await res.json(); setSyncing(null);
-    if (!res.ok) { alert(d.error ?? "Sync failed."); return; }
-    alert("Synced! " + d.created + " new post(s)."); load();
+    const d = await readResponse(res); setSyncing(null);
+    if (!res.ok) { alert(d?.error ?? "Sync failed."); return; }
+    alert("Synced! " + (d?.created ?? 0) + " new post(s)."); load();
   }
   async function del(id: string, name: string) {
     if (!confirm("Delete \"" + name + "\" and all their tracked posts?")) return;
@@ -131,8 +148,8 @@ function AddCreatorForm({ onClose, onAdded }: { onClose: ()=>void; onAdded: ()=>
   async function submit(e: React.FormEvent) {
     e.preventDefault(); setLoading(true); setError(null);
     const res = await fetch("/api/creators", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ platform, input, tagIds, fetchRecent }) });
-    const data = await res.json(); setLoading(false);
-    if (!res.ok) { setError(data.error ?? "Failed to add."); return; }
+    const data = await readResponse(res); setLoading(false);
+    if (!res.ok) { setError(data?.error ?? "Failed to add."); return; }
     onAdded(); onClose();
   }
 

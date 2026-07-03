@@ -12,6 +12,8 @@ import { calculateVph, calculateGrowthSince } from "@/lib/metrics";
 import type { Creator, KeywordTracker } from "@prisma/client";
 import { searchPlatform } from "./platforms/index";
 
+const DEFAULT_CREATOR_SYNC_MAX_POSTS = 120;
+
 function chunks<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -19,7 +21,7 @@ function chunks<T>(arr: T[], size: number): T[][] {
 }
 
 /** Sync new posts for a single creator. */
-export async function syncCreatorPosts(creator: Creator, max = 20) {
+export async function syncCreatorPosts(creator: Creator, max = DEFAULT_CREATOR_SYNC_MAX_POSTS) {
   const meta = (creator.platformMeta ?? {}) as Record<string, unknown>;
   let stubs;
 

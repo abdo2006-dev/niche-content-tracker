@@ -39,6 +39,9 @@ const HEADERS = {
 };
 
 const BASE = "https://i.instagram.com/api/v1";
+const RECENT_LOOKBACK_DAYS = 14;
+const MAX_INSTAGRAM_PAGES = 6;
+const instagramItemCache = new Map<string, any>();
 
 async function log(endpoint: string) {
   try {
@@ -46,6 +49,10 @@ async function log(endpoint: string) {
       data: { platform: "INSTAGRAM", endpoint, units: 1 },
     });
   } catch {}
+}
+
+function cutoffDate(days = RECENT_LOOKBACK_DAYS) {
+  return new Date(Date.now() - days * 86_400_000);
 }
 
 async function igGet(path: string, params?: Record<string, string>): Promise<any> {
@@ -83,6 +90,64 @@ function mediaType(igType: string): "VIDEO" | "IMAGE" | "CAROUSEL" {
   return "IMAGE";
 }
 
+function instagramItemId(item: any): string | null {
+  const id = item?.pk ?? item?.id;
+  return id ? String(id) : null;
+}
+
+function instagramItemToStub(item: any): PostStub | null {
+  const id = instagramItemId(item);
+  if (!id || !item?.taken_at) return null;
+  return {
+    platformId: id,
+    publishedAt: new Date(Number(item.taken_at) * 1000).toISOString(),
+    raw: item,
+  };
+}
+
+function profileEdgeToStub(edge: any): PostStub | null {
+  const node = edge?.node;
+  const id = node?.id ?? node?.shortcode;
+  if (!id || !node?.taken_at_timestamp) return null;
+  return {
+    platformId: String(id),
+    publishedAt: new Date(Number(node.taken_at_timestamp) * 1000).toISOString(),
+    raw: node,
+  };
+}
+
+function instagramItemToPost(item: any, fallbackId: string): ResolvedPost | null {
+  if (!item) return null;
+  const id = String(item.pk ?? item.id ?? fallbackId);
+  const isVideo = item.media_type === 2 || item.media_type === "VIDEO";
+  const isCarousel = item.media_type === 8 || item.media_type === "CAROUSEL_ALBUM";
+  const shortcode = item.code ?? item.shortcode ?? item.short_code;
+  const caption = item.caption?.text ?? item.edge_media_to_caption?.edges?.[0]?.node?.text ?? "";
+
+  return {
+    platform: "INSTAGRAM",
+    platformId: id,
+    title: caption.slice(0, 200) || null,
+    description: caption.slice(0, 300) || null,
+    publishedAt: new Date(Number(item.taken_at ?? item.taken_at_timestamp ?? 0) * 1000).toISOString(),
+    thumbnailUrl:
+      item.thumbnail_url ??
+      item.display_url ??
+      item.image_versions2?.candidates?.[0]?.url ??
+      item.carousel_media?.[0]?.image_versions2?.candidates?.[0]?.url ??
+      null,
+    durationSeconds: Math.round(item.video_duration ?? 0),
+    isShort: isVideo && (item.video_duration ?? 0) <= 90,
+    url: `https://www.instagram.com/p/${shortcode ?? id}/`,
+    mediaType: isCarousel ? "CAROUSEL" : isVideo ? "VIDEO" : "IMAGE",
+    viewCount: BigInt(item.view_count ?? item.play_count ?? item.video_view_count ?? 0),
+    likeCount: BigInt(item.like_count ?? item.edge_liked_by?.count ?? 0),
+    commentCount: BigInt(item.comment_count ?? item.edge_media_to_comment?.count ?? 0),
+    shareCount: BigInt(0),
+    saveCount: BigInt(0),
+  };
+}
+
 // --- Creator resolution -----------------------------------------------------
 
 export async function resolveInstagramCreator(input: string): Promise<ResolvedCreator> {
@@ -113,16 +178,40 @@ export async function resolveInstagramCreator(input: string): Promise<ResolvedCr
 
 // --- Recent posts -----------------------------------------------------------
 
-export async function fetchInstagramRecentPosts(userId: string, max = 20): Promise<PostStub[]> {
+export async function fetchInstagramRecentPosts(userId: string, max = 120): Promise<PostStub[]> {
   // First try the feed endpoint (gives more posts + cleaner data)
   try {
-    const data = await igGet(`/feed/user/${userId}/`, { count: String(Math.min(max, 20)) });
-    await log("feed/user/{id}");
-    const items: any[] = data?.items ?? [];
-    return items.map((m: any): PostStub => ({
-      platformId: m.pk ?? m.id,
-      publishedAt: new Date((m.taken_at ?? 0) * 1000).toISOString(),
-    }));
+    const cutoff = cutoffDate();
+    const results: PostStub[] = [];
+    let maxId: string | undefined;
+
+    for (let page = 0; page < MAX_INSTAGRAM_PAGES && results.length < max; page++) {
+      const data = await igGet(`/feed/user/${userId}/`, {
+        count: String(Math.min(max - results.length, 50)),
+        ...(maxId ? { max_id: maxId } : {}),
+      });
+      await log("feed/user/{id}");
+      const items: any[] = data?.items ?? [];
+      if (!items.length) break;
+
+      let reachedOlderPosts = false;
+      for (const item of items) {
+        const stub = instagramItemToStub(item);
+        if (!stub) continue;
+        instagramItemCache.set(stub.platformId, item);
+        if (new Date(stub.publishedAt) < cutoff) {
+          reachedOlderPosts = true;
+          continue;
+        }
+        results.push(stub);
+        if (results.length >= max) break;
+      }
+
+      maxId = data?.next_max_id;
+      if (reachedOlderPosts || !maxId) break;
+    }
+
+    return results.slice(0, max);
   } catch {
     // Fall back to the profile info endpoint which includes last 12 posts in edge_owner_to_timeline_media
     const username = userId; // This fallback needs username not ID — handled in sync.ts
@@ -131,17 +220,19 @@ export async function fetchInstagramRecentPosts(userId: string, max = 20): Promi
 }
 
 /** Called by sync.ts which resolves username from platformMeta when needed. */
-export async function fetchInstagramRecentPostsByUsername(username: string, max = 20): Promise<PostStub[]> {
+export async function fetchInstagramRecentPostsByUsername(username: string, max = 120): Promise<PostStub[]> {
   const data = await igGet(`/users/web_profile_info/`, { username });
   await log("web_profile_info");
 
   const edges =
     data?.data?.user?.edge_owner_to_timeline_media?.edges ?? [];
 
-  return edges.slice(0, max).map((e: any): PostStub => ({
-    platformId: e.node?.id ?? e.node?.shortcode,
-    publishedAt: new Date((e.node?.taken_at_timestamp ?? 0) * 1000).toISOString(),
-  }));
+  const cutoff = cutoffDate();
+  return edges
+    .map(profileEdgeToStub)
+    .filter((stub: PostStub | null): stub is PostStub => Boolean(stub))
+    .filter((stub: PostStub) => new Date(stub.publishedAt) >= cutoff)
+    .slice(0, max);
 }
 
 // --- Post details -----------------------------------------------------------
@@ -151,35 +242,19 @@ export async function fetchInstagramPostDetails(mediaIds: string[]): Promise<Res
 
   for (const id of mediaIds) {
     try {
+      const cached = instagramItemToPost(instagramItemCache.get(id), id);
+      if (cached) {
+        results.push(cached);
+        continue;
+      }
+
       const data = await igGet(`/media/${id}/info/`);
       await log("media/{id}/info");
       const m = data?.items?.[0];
       if (!m) continue;
 
-      const isVideo = m.media_type === 2; // 1=photo, 2=video, 8=carousel
-      const isCarousel = m.media_type === 8;
-
-      results.push({
-        platform: "INSTAGRAM",
-        platformId: String(m.pk ?? m.id),
-        title: (m.caption?.text ?? "").slice(0, 200) || null,
-        description: (m.caption?.text ?? "").slice(0, 300) || null,
-        publishedAt: new Date((m.taken_at ?? 0) * 1000).toISOString(),
-        thumbnailUrl:
-          m.thumbnail_url ??
-          m.image_versions2?.candidates?.[0]?.url ??
-          m.carousel_media?.[0]?.image_versions2?.candidates?.[0]?.url ??
-          null,
-        durationSeconds: Math.round(m.video_duration ?? 0),
-        isShort: isVideo && (m.video_duration ?? 0) <= 90, // Reels are ≤90s
-        url: `https://www.instagram.com/p/${m.code ?? m.shortcode}/`,
-        mediaType: isCarousel ? "CAROUSEL" : isVideo ? "VIDEO" : "IMAGE",
-        viewCount: BigInt(m.view_count ?? m.play_count ?? 0),
-        likeCount: BigInt(m.like_count ?? 0),
-        commentCount: BigInt(m.comment_count ?? 0),
-        shareCount: BigInt(0), // Instagram doesn't expose share counts publicly
-        saveCount: BigInt(0),
-      });
+      const post = instagramItemToPost(m, id);
+      if (post) results.push(post);
     } catch {
       // Individual post may be deleted/private — skip
     }
