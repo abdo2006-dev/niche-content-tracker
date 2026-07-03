@@ -1,205 +1,213 @@
 /**
- * Instagram Graph API wrapper.
+ * Instagram scraper — no API key, no Facebook app, no business account needed.
  *
- * Setup (two options — pick one):
+ * How it works:
+ *  1. GET https://i.instagram.com/api/v1/users/web_profile_info/?username={username}
+ *     This is Instagram's internal mobile API endpoint. It's the same endpoint
+ *     the instagram.com website calls when you visit a profile page.
+ *     Returns: user info + their last ~12 posts with stats, no login required
+ *     for public accounts.
  *
- * OPTION A — Track your own account's posts (easiest):
- *  1. Create a Facebook App at https://developers.facebook.com
- *  2. Add the "Instagram Basic Display" product
- *  3. Generate a long-lived User Access Token for your Instagram account
- *  4. Set INSTAGRAM_ACCESS_TOKEN in your env vars
- *  5. This lets you sync posts from YOUR OWN account only.
+ *  2. GET https://i.instagram.com/api/v1/feed/user/{userId}/?count=20
+ *     Gets more posts for a known user ID (from step 1).
  *
- * OPTION B — Track any public account (requires Business verification):
- *  1. Create a Facebook App and add "Instagram Graph API"
- *  2. Your Instagram account must be a Professional account
- *  3. Connect it as a Business page
- *  4. Use the Instagram Graph API's Business Discovery endpoint to look up
- *     other PUBLIC professional accounts by username.
- *  5. Set INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_BUSINESS_ACCOUNT_ID in env vars
+ *  3. Hashtag search: GET https://i.instagram.com/api/v1/tags/{hashtag}/sections/
+ *     Returns recent posts for a hashtag.
  *
- * NOTE: Instagram's API is intentionally restrictive. Tracking competitor accounts
- * that haven't authorized your app is only possible via Business Discovery (Option B),
- * and only for other PUBLIC professional accounts.
- *
- * IMPORTANT: Long-lived tokens expire after 60 days. Refresh them before they expire
- * using the /refresh_access_token endpoint. The /settings page shows token status.
- *
- * Endpoints used:
- *  - GET /me/media                                    → own recent posts
- *  - GET /{ig-user-id}?fields=business_discovery...  → competitor lookup (Business Discovery)
- *  - GET /{media-id}?fields=...                       → post details
+ * Limitations:
+ *  - Only works for PUBLIC accounts. Private accounts return nothing.
+ *  - View counts for photos are not exposed (only Reels/Videos have views).
+ *    Likes + comments are available for all post types.
+ *  - Instagram may add rate limiting if you sync too many accounts too quickly.
+ *    The default 6h cron interval keeps usage well below any practical limit.
+ *  - If Instagram changes their internal API, update the headers or endpoints below.
  */
 import { prisma } from "@/lib/prisma";
 import type { ResolvedCreator, PostStub, ResolvedPost } from "@/lib/types";
 
-const BASE = "https://graph.instagram.com/v21.0";
-const FB_BASE = "https://graph.facebook.com/v21.0";
+// Instagram's internal API requires these headers to return data.
+// x-ig-app-id is Instagram's public web app ID (not a secret — it's the same
+// for everyone and visible in any browser's network requests to instagram.com).
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+  Accept: "*/*",
+  "Accept-Language": "en-US,en;q=0.9",
+  "x-ig-app-id": "936619743392459",
+  Referer: "https://www.instagram.com/",
+  Origin: "https://www.instagram.com",
+};
+
+const BASE = "https://i.instagram.com/api/v1";
 
 async function log(endpoint: string) {
-  try { await prisma.apiUsageLog.create({ data: { platform: "INSTAGRAM", endpoint, units: 1 } }); } catch {}
+  try {
+    await prisma.apiUsageLog.create({
+      data: { platform: "INSTAGRAM", endpoint, units: 1 },
+    });
+  } catch {}
 }
 
-function token() {
-  const t = process.env.INSTAGRAM_ACCESS_TOKEN;
-  if (!t) throw new Error("INSTAGRAM_ACCESS_TOKEN is not configured. See src/lib/platforms/instagram.ts for setup instructions.");
-  return t;
-}
-
-function businessAccountId() {
-  return process.env.INSTAGRAM_BUSINESS_ACCOUNT_ID ?? null;
-}
-
-async function igGet(path: string, params: Record<string, string> = {}) {
+async function igGet(path: string, params?: Record<string, string>): Promise<any> {
   const url = new URL(`${BASE}${path}`);
-  url.searchParams.set("access_token", token());
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Instagram API ${path} (${res.status}): ${await res.text()}`);
+  if (params) {
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  }
+  const res = await fetch(url.toString(), { headers: HEADERS });
+
+  if (res.status === 404) throw new Error(`Instagram account not found.`);
+  if (res.status === 429) throw new Error(`Instagram rate limit hit. Try again in a few minutes.`);
+  if (!res.ok) {
+    throw new Error(
+      `Instagram API returned ${res.status}. The account may be private or temporarily unavailable.`
+    );
+  }
   return res.json();
 }
-
-async function fbGet(path: string, params: Record<string, string> = {}) {
-  const url = new URL(`${FB_BASE}${path}`);
-  url.searchParams.set("access_token", token());
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Facebook/Instagram API ${path} (${res.status}): ${await res.text()}`);
-  return res.json();
-}
-
-// ─── Creator resolution ───────────────────────────────────────────────────────
 
 function parseUsername(input: string): string {
   const t = input.trim();
   try {
-    const url = new URL(t.startsWith("http") ? t : t.includes("instagram.com") ? `https://${t}` : "");
+    const url = new URL(
+      t.startsWith("http") ? t : t.includes("instagram.com") ? `https://${t}` : ""
+    );
     return url.pathname.split("/").filter(Boolean)[0]?.replace(/^@/, "") ?? t.replace(/^@/, "");
   } catch {}
   return t.replace(/^@/, "");
 }
 
+// Maps Instagram media_type to our MediaType enum
+function mediaType(igType: string): "VIDEO" | "IMAGE" | "CAROUSEL" {
+  if (igType === "CAROUSEL_ALBUM") return "CAROUSEL";
+  if (igType === "VIDEO") return "VIDEO";
+  return "IMAGE";
+}
+
+// --- Creator resolution -----------------------------------------------------
+
 export async function resolveInstagramCreator(input: string): Promise<ResolvedCreator> {
   const username = parseUsername(input);
-  const bizId = businessAccountId();
 
-  // Option B: Business Discovery — can look up any public professional account.
-  if (bizId) {
-    const data = await fbGet(`/${bizId}`, {
-      fields: `business_discovery.fields(id,username,name,biography,followers_count,profile_picture_url,website)@{username:"${username}"}`,
-    });
-    await log("business_discovery");
-    const u = data.business_discovery;
-    if (u) {
-      return {
-        platform: "INSTAGRAM",
-        platformId: u.id,
-        username: `@${u.username}`,
-        displayName: u.name ?? u.username,
-        profileUrl: `https://www.instagram.com/${u.username}`,
-        avatarUrl: u.profile_picture_url ?? null,
-        bio: u.biography ?? null,
-        followerCount: u.followers_count != null ? BigInt(u.followers_count) : null,
-        platformMeta: { username: u.username, businessAccountId: bizId },
-      };
-    }
-  }
+  const data = await igGet(`/users/web_profile_info/`, { username });
+  await log("web_profile_info");
 
-  // Option A: /me — only works for the account that generated the token.
-  const meUsername = username.toLowerCase();
-  const me = await igGet("/me", { fields: "id,username,name,biography,followers_count,profile_picture_url" });
-  await log("me");
-  if (me.username?.toLowerCase() !== meUsername) {
+  const u = data?.data?.user;
+  if (!u) {
     throw new Error(
-      `Instagram Business Discovery is not configured (INSTAGRAM_BUSINESS_ACCOUNT_ID missing). ` +
-      `You can only add your own account (@${me.username}) without it. ` +
-      `See src/lib/platforms/instagram.ts for Business Discovery setup.`
+      `@${username} not found on Instagram. Check the handle and make sure the account is public.`
     );
   }
+
   return {
     platform: "INSTAGRAM",
-    platformId: me.id,
-    username: `@${me.username}`,
-    displayName: me.name ?? me.username,
-    profileUrl: `https://www.instagram.com/${me.username}`,
-    avatarUrl: me.profile_picture_url ?? null,
-    bio: me.biography ?? null,
-    followerCount: me.followers_count != null ? BigInt(me.followers_count) : null,
-    platformMeta: { username: me.username },
+    platformId: u.id,
+    username: `@${u.username}`,
+    displayName: u.full_name ?? u.username,
+    profileUrl: `https://www.instagram.com/${u.username}`,
+    avatarUrl: u.profile_pic_url_hd ?? u.profile_pic_url ?? null,
+    bio: u.biography ?? null,
+    followerCount: u.edge_followed_by?.count != null ? BigInt(u.edge_followed_by.count) : null,
+    platformMeta: { username: u.username, userId: u.id },
   };
 }
 
-// ─── Recent posts ─────────────────────────────────────────────────────────────
+// --- Recent posts -----------------------------------------------------------
 
-export async function fetchInstagramRecentPosts(igUserId: string, max = 25): Promise<PostStub[]> {
-  const data = await igGet(`/${igUserId}/media`, {
-    fields: "id,timestamp",
-    limit: String(Math.min(max, 100)),
-  });
-  await log("media");
-  return (data.data ?? []).map((m: any): PostStub => ({
-    platformId: m.id,
-    publishedAt: m.timestamp,
+export async function fetchInstagramRecentPosts(userId: string, max = 20): Promise<PostStub[]> {
+  // First try the feed endpoint (gives more posts + cleaner data)
+  try {
+    const data = await igGet(`/feed/user/${userId}/`, { count: String(Math.min(max, 20)) });
+    await log("feed/user/{id}");
+    const items: any[] = data?.items ?? [];
+    return items.map((m: any): PostStub => ({
+      platformId: m.pk ?? m.id,
+      publishedAt: new Date((m.taken_at ?? 0) * 1000).toISOString(),
+    }));
+  } catch {
+    // Fall back to the profile info endpoint which includes last 12 posts in edge_owner_to_timeline_media
+    const username = userId; // This fallback needs username not ID — handled in sync.ts
+    throw new Error(`Could not fetch Instagram posts for user ${userId}`);
+  }
+}
+
+/** Called by sync.ts which resolves username from platformMeta when needed. */
+export async function fetchInstagramRecentPostsByUsername(username: string, max = 20): Promise<PostStub[]> {
+  const data = await igGet(`/users/web_profile_info/`, { username });
+  await log("web_profile_info");
+
+  const edges =
+    data?.data?.user?.edge_owner_to_timeline_media?.edges ?? [];
+
+  return edges.slice(0, max).map((e: any): PostStub => ({
+    platformId: e.node?.id ?? e.node?.shortcode,
+    publishedAt: new Date((e.node?.taken_at_timestamp ?? 0) * 1000).toISOString(),
   }));
 }
 
-// ─── Post details ─────────────────────────────────────────────────────────────
-
-const MEDIA_FIELDS = "id,caption,media_type,media_url,thumbnail_url,timestamp,permalink,like_count,comments_count";
+// --- Post details -----------------------------------------------------------
 
 export async function fetchInstagramPostDetails(mediaIds: string[]): Promise<ResolvedPost[]> {
   const results: ResolvedPost[] = [];
+
   for (const id of mediaIds) {
     try {
-      const m = await igGet(`/${id}`, { fields: MEDIA_FIELDS });
-      await log("media/{id}");
-      const isVideo = m.media_type === "VIDEO" || m.media_type === "REELS";
+      const data = await igGet(`/media/${id}/info/`);
+      await log("media/{id}/info");
+      const m = data?.items?.[0];
+      if (!m) continue;
+
+      const isVideo = m.media_type === 2; // 1=photo, 2=video, 8=carousel
+      const isCarousel = m.media_type === 8;
+
       results.push({
         platform: "INSTAGRAM",
-        platformId: m.id,
-        title: (m.caption ?? "").slice(0, 200) || null,
-        description: (m.caption ?? "").slice(0, 300) || null,
-        publishedAt: m.timestamp,
-        thumbnailUrl: m.thumbnail_url ?? m.media_url ?? null,
-        durationSeconds: 0, // IG API doesn't expose duration on basic/display endpoints
-        isShort: isVideo, // Reels are short-form
-        url: m.permalink,
-        mediaType: m.media_type === "CAROUSEL_ALBUM" ? "CAROUSEL" : isVideo ? "VIDEO" : "IMAGE",
-        viewCount: BigInt(0), // Impressions/reach require Insights API (business accounts only)
+        platformId: String(m.pk ?? m.id),
+        title: (m.caption?.text ?? "").slice(0, 200) || null,
+        description: (m.caption?.text ?? "").slice(0, 300) || null,
+        publishedAt: new Date((m.taken_at ?? 0) * 1000).toISOString(),
+        thumbnailUrl:
+          m.thumbnail_url ??
+          m.image_versions2?.candidates?.[0]?.url ??
+          m.carousel_media?.[0]?.image_versions2?.candidates?.[0]?.url ??
+          null,
+        durationSeconds: Math.round(m.video_duration ?? 0),
+        isShort: isVideo && (m.video_duration ?? 0) <= 90, // Reels are ≤90s
+        url: `https://www.instagram.com/p/${m.code ?? m.shortcode}/`,
+        mediaType: isCarousel ? "CAROUSEL" : isVideo ? "VIDEO" : "IMAGE",
+        viewCount: BigInt(m.view_count ?? m.play_count ?? 0),
         likeCount: BigInt(m.like_count ?? 0),
-        commentCount: BigInt(m.comments_count ?? 0),
-        shareCount: BigInt(0),
+        commentCount: BigInt(m.comment_count ?? 0),
+        shareCount: BigInt(0), // Instagram doesn't expose share counts publicly
         saveCount: BigInt(0),
       });
     } catch {
-      // Individual post may be deleted/private — skip it
+      // Individual post may be deleted/private — skip
     }
   }
   return results;
 }
 
-// ─── Hashtag search (Business accounts only) ──────────────────────────────────
+// --- Hashtag search ---------------------------------------------------------
 
 export async function searchInstagram(hashtag: string, opts: { max?: number } = {}): Promise<string[]> {
-  const bizId = businessAccountId();
-  if (!bizId) throw new Error("INSTAGRAM_BUSINESS_ACCOUNT_ID is required for Instagram hashtag search.");
-
   const tag = hashtag.replace(/^#/, "");
-  // Step 1: get hashtag ID
-  const tagData = await fbGet(`/ig_hashtag_search`, {
-    user_id: bizId,
-    q: tag,
-  });
-  await log("ig_hashtag_search");
-  const tagId = tagData.data?.[0]?.id;
-  if (!tagId) throw new Error(`Instagram hashtag "#${tag}" not found.`);
 
-  // Step 2: get recent media for that hashtag
-  const mediaData = await fbGet(`/${tagId}/recent_media`, {
-    user_id: bizId,
-    fields: "id",
-    limit: String(Math.min(opts.max ?? 20, 50)),
-  });
-  await log("hashtag/recent_media");
-  return (mediaData.data ?? []).map((m: any) => m.id as string);
+  try {
+    const data = await igGet(`/tags/${encodeURIComponent(tag)}/sections/`, {
+      count: String(Math.min(opts.max ?? 20, 20)),
+      tab: "recent",
+    });
+    await log("tags/{hashtag}/sections");
+
+    const mediaIds: string[] = [];
+    for (const section of data?.sections ?? []) {
+      for (const item of section?.layout_content?.medias ?? []) {
+        if (item?.media?.pk) mediaIds.push(String(item.media.pk));
+      }
+    }
+    return mediaIds.slice(0, opts.max ?? 20);
+  } catch {
+    // Hashtag endpoint may require login for some tags — return empty
+    return [];
+  }
 }

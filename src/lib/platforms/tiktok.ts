@@ -1,76 +1,57 @@
 /**
- * TikTok Research API wrapper.
+ * TikTok scraper — no API key, no account, no approval needed.
  *
- * Setup:
- *  1. Apply for TikTok Research API access at https://developers.tiktok.com/products/research-api
- *  2. Once approved, create an app and get TIKTOK_CLIENT_KEY + TIKTOK_CLIENT_SECRET.
- *  3. The Research API gives access to PUBLIC video data for research purposes.
+ * How it works:
+ *  1. GET https://www.tiktok.com/@{username}  — TikTok embeds the user's full
+ *     profile data (including secUid) in a <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">
+ *     tag in the HTML. We parse that JSON.
+ *  2. GET https://m.tiktok.com/api/post/item_list/ — TikTok's internal mobile
+ *     API that the web app itself uses to load the video grid. We pass the
+ *     secUid from step 1 to get a paginated list of videos with their stats.
+ *  3. For keyword search we use the hashtag challenge page:
+ *     https://www.tiktok.com/tag/{hashtag}
  *
- * Endpoints used:
- *  - POST /v2/oauth/token/                → get an app-level token (client_credentials)
- *  - POST /v2/research/video/query/       → search videos by keyword or username
- *  - POST /v2/research/user/info/         → get a user's public profile
- *
- * Rate limits: ~1000 requests/day on the Research API (varies by approval tier).
- * We log every call to ApiUsageLog (1 unit each) so you can monitor usage.
- *
- * NOTE: If you don't have Research API access yet, the app still works for
- * YouTube and Instagram — TikTok creators will show as "not configured" with
- * a clear error message.
+ * Limitations:
+ *  - Private accounts return no videos.
+ *  - TikTok rate-limits aggressive crawling — we stay well within safe limits
+ *    by only syncing on the cron schedule (every 6h per creator).
+ *  - If TikTok changes their HTML structure, parsing will fail gracefully with
+ *    a clear error message. The workaround is to update the selector below.
  */
 import { prisma } from "@/lib/prisma";
 import type { ResolvedCreator, PostStub, ResolvedPost } from "@/lib/types";
 
-const BASE = "https://open.tiktokapis.com";
+// --- Shared browser-like headers -------------------------------------------
+// TikTok blocks plain Node.js UA strings. Using a real Chrome UA is enough
+// for a low-frequency personal tool.
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  Referer: "https://www.tiktok.com/",
+  "Cache-Control": "no-cache",
+};
 
-// Token cache — app-level tokens last ~2h, cache in memory between requests.
-let cachedToken: { value: string; expiresAt: number } | null = null;
+const API_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  Referer: "https://www.tiktok.com/",
+};
 
 async function log(endpoint: string) {
-  try { await prisma.apiUsageLog.create({ data: { platform: "TIKTOK", endpoint, units: 1 } }); } catch {}
+  try {
+    await prisma.apiUsageLog.create({
+      data: { platform: "TIKTOK", endpoint, units: 1 },
+    });
+  } catch {}
 }
 
-function creds() {
-  const k = process.env.TIKTOK_CLIENT_KEY;
-  const s = process.env.TIKTOK_CLIENT_SECRET;
-  if (!k || !s) throw new Error("TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET are not configured. See src/lib/platforms/tiktok.ts for setup instructions.");
-  return { clientKey: k, clientSecret: s };
-}
-
-async function getAccessToken(): Promise<string> {
-  if (cachedToken && cachedToken.expiresAt > Date.now() + 60_000) return cachedToken.value;
-  const { clientKey, clientSecret } = creds();
-  const res = await fetch(`${BASE}/v2/oauth/token/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_key: clientKey,
-      client_secret: clientSecret,
-      grant_type: "client_credentials",
-    }),
-  });
-  if (!res.ok) throw new Error(`TikTok OAuth failed (${res.status}): ${await res.text()}`);
-  const data = await res.json();
-  cachedToken = { value: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
-  return cachedToken.value;
-}
-
-async function post(path: string, body: unknown) {
-  const token = await getAccessToken();
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`TikTok API ${path} (${res.status}): ${await res.text()}`);
-  return res.json();
-}
-
-// ─── Creator resolution ───────────────────────────────────────────────────────
-
-function parseUsername(input: string): string {
+function clean(username: string): string {
   // Accept: @username, username, https://tiktok.com/@username, tiktok.com/@username
-  const t = input.trim();
+  const t = username.trim();
   try {
     const url = new URL(t.startsWith("http") ? t : t.includes("tiktok.com") ? `https://${t}` : "");
     const parts = url.pathname.split("/").filter(Boolean);
@@ -79,117 +60,187 @@ function parseUsername(input: string): string {
   return t.replace(/^@/, "");
 }
 
-export async function resolveTikTokCreator(input: string): Promise<ResolvedCreator> {
-  const username = parseUsername(input);
-  // Research API: get user info by username
-  const data = await post("/v2/research/user/info/", {
-    username,
-    fields: ["display_name", "bio_description", "avatar_url", "follower_count", "video_count"],
-  });
-  await log("research/user/info");
+/** Parses the __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON from a TikTok page. */
+async function parsePageData(url: string): Promise<any> {
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`TikTok page fetch failed (${res.status}) for ${url}`);
+  const html = await res.text();
 
-  const u = data.data?.user_info;
-  if (!u) throw new Error(`TikTok user "@${username}" not found.`);
+  const match = html.match(
+    /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/
+  );
+  if (!match) {
+    throw new Error(
+      `Could not find TikTok embedded data on ${url}. ` +
+        `The account may be private, or TikTok may have changed their HTML. ` +
+        `Try adding the creator manually.`
+    );
+  }
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    throw new Error(`Failed to parse TikTok page data from ${url}`);
+  }
+}
+
+// --- Creator resolution -----------------------------------------------------
+
+export async function resolveTikTokCreator(input: string): Promise<ResolvedCreator> {
+  const username = clean(input);
+  const data = await parsePageData(`https://www.tiktok.com/@${username}`);
+  await log("scrape/@username");
+
+  const scope = data["__DEFAULT_SCOPE__"] ?? {};
+  const userDetail = scope["webapp.user-detail"];
+  const userInfo = userDetail?.userInfo;
+  const user = userInfo?.user;
+  const stats = userInfo?.stats;
+
+  if (!user) {
+    throw new Error(
+      `@${username} not found on TikTok. Make sure the handle is correct and the account is public.`
+    );
+  }
 
   return {
     platform: "TIKTOK",
-    platformId: u.open_id ?? username, // open_id is the stable ID
-    username: `@${username}`,
-    displayName: u.display_name ?? username,
-    profileUrl: `https://www.tiktok.com/@${username}`,
-    avatarUrl: u.avatar_url ?? null,
-    bio: u.bio_description ?? null,
-    followerCount: u.follower_count != null ? BigInt(u.follower_count) : null,
-    platformMeta: { username, secUid: u.secure_user_id ?? null },
+    platformId: user.id,
+    username: `@${user.uniqueId ?? username}`,
+    displayName: user.nickname ?? user.uniqueId ?? username,
+    profileUrl: `https://www.tiktok.com/@${user.uniqueId ?? username}`,
+    avatarUrl: user.avatarLarger ?? user.avatarMedium ?? null,
+    bio: user.signature ?? null,
+    followerCount: stats?.followerCount != null ? BigInt(stats.followerCount) : null,
+    platformMeta: {
+      username: user.uniqueId ?? username,
+      secUid: user.secUid ?? null,
+    },
   };
 }
 
-// ─── Recent posts ─────────────────────────────────────────────────────────────
+// --- Recent posts -----------------------------------------------------------
 
-export async function fetchTikTokRecentPosts(username: string, max = 20): Promise<PostStub[]> {
-  // Research API: query videos by username
-  const data = await post("/v2/research/video/query/", {
-    query: { and: [{ operation: "EQ", field_name: "username", field_values: [username] }] },
-    start_date: formatDate(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
-    end_date: formatDate(new Date()),
-    max_count: Math.min(max, 100),
-    fields: ["id", "create_time"],
-    sort_type: "0", // 0 = by time desc
+export async function fetchTikTokRecentPosts(username: string, max = 30): Promise<PostStub[]> {
+  // First get secUid from the profile page (it's embedded in the HTML)
+  const data = await parsePageData(`https://www.tiktok.com/@${username}`);
+  await log("scrape/@username");
+
+  const scope = data["__DEFAULT_SCOPE__"] ?? {};
+  const user = scope["webapp.user-detail"]?.userInfo?.user;
+  const secUid = user?.secUid;
+
+  if (!secUid) {
+    // Fall back: try to extract some videos that may be embedded in the page HTML
+    const videoItems: PostStub[] = [];
+    const itemList = scope["webapp.user-detail"]?.itemList ?? [];
+    for (const item of itemList) {
+      if (item?.id && item?.createTime) {
+        videoItems.push({
+          platformId: String(item.id),
+          publishedAt: new Date(item.createTime * 1000).toISOString(),
+        });
+      }
+    }
+    return videoItems.slice(0, max);
+  }
+
+  // Use TikTok's internal mobile API — the same one the web app calls
+  const params = new URLSearchParams({
+    aid: "1988",
+    count: String(Math.min(max, 35)),
+    secUid,
+    cursor: "0",
+    sourceType: "8",
+    appId: "1233",
   });
-  await log("research/video/query");
 
-  return (data.data?.videos ?? []).map((v: any): PostStub => ({
-    platformId: String(v.id),
-    publishedAt: new Date(v.create_time * 1000).toISOString(),
+  const res = await fetch(`https://m.tiktok.com/api/post/item_list/?${params}`, {
+    headers: API_HEADERS,
+  });
+  await log("api/post/item_list");
+
+  if (!res.ok) throw new Error(`TikTok video list failed (${res.status})`);
+  const json = await res.json();
+
+  return (json.itemList ?? []).map((item: any): PostStub => ({
+    platformId: String(item.id),
+    publishedAt: new Date((item.createTime ?? 0) * 1000).toISOString(),
   }));
 }
 
-// ─── Video details ────────────────────────────────────────────────────────────
+// --- Video details ----------------------------------------------------------
 
 export async function fetchTikTokPostDetails(videoIds: string[]): Promise<ResolvedPost[]> {
   if (!videoIds.length) return [];
   const results: ResolvedPost[] = [];
 
-  // Research API allows querying by video_id — fetch in batches of 20
-  for (let i = 0; i < videoIds.length; i += 20) {
-    const batch = videoIds.slice(i, i + 20);
-    const data = await post("/v2/research/video/query/", {
-      query: {
-        and: [{ operation: "IN", field_name: "video_id", field_values: batch }],
-      },
-      start_date: "20200101",
-      end_date: formatDate(new Date()),
-      max_count: 20,
-      fields: [
-        "id", "create_time", "cover_image_url", "share_url", "video_description",
-        "duration", "like_count", "comment_count", "share_count", "view_count",
-        "music_id", "hashtag_names",
-      ],
-    });
-    await log("research/video/query");
+  for (const id of videoIds) {
+    try {
+      // Scrape the individual video page — stats are embedded in the HTML
+      // We use a short URL which redirects to the full canonical URL
+      const data = await parsePageData(`https://www.tiktok.com/video/${id}`);
+      await log("scrape/video/{id}");
 
-    for (const v of data.data?.videos ?? []) {
-      const dur = Number(v.duration ?? 0);
+      const scope = data["__DEFAULT_SCOPE__"] ?? {};
+      const videoDetail =
+        scope["webapp.video-detail"]?.itemInfo?.itemStruct ??
+        scope["seo.abtest"]?.canonical; // fallback key TikTok sometimes uses
+
+      // Also try the item list if video detail page was embedded differently
+      const item = videoDetail ?? scope["webapp.video-detail"]?.itemInfo;
+      if (!item) continue;
+
+      const video = item.video ?? {};
+      const stats = item.stats ?? {};
+      const desc = (item.desc ?? "").slice(0, 300);
+      const dur = Number(video.duration ?? 0);
+
       results.push({
         platform: "TIKTOK",
-        platformId: String(v.id),
-        title: v.video_description?.slice(0, 200) ?? null,
-        description: v.video_description?.slice(0, 300) ?? null,
-        publishedAt: new Date(v.create_time * 1000).toISOString(),
-        thumbnailUrl: v.cover_image_url ?? null,
+        platformId: String(item.id ?? id),
+        title: desc.slice(0, 200) || null,
+        description: desc || null,
+        publishedAt: new Date((item.createTime ?? 0) * 1000).toISOString(),
+        thumbnailUrl: video.cover ?? video.dynamicCover ?? null,
         durationSeconds: dur,
         isShort: true, // TikToks are always short-form
-        url: v.share_url ?? `https://www.tiktok.com/video/${v.id}`,
+        url: `https://www.tiktok.com/@${item.author?.uniqueId ?? "unknown"}/video/${item.id ?? id}`,
         mediaType: "VIDEO",
-        viewCount: BigInt(v.view_count ?? 0),
-        likeCount: BigInt(v.like_count ?? 0),
-        commentCount: BigInt(v.comment_count ?? 0),
-        shareCount: BigInt(v.share_count ?? 0),
-        saveCount: BigInt(0),
-        platformMeta: { hashtags: v.hashtag_names ?? [] },
+        viewCount: BigInt(stats.playCount ?? stats.viewCount ?? 0),
+        likeCount: BigInt(stats.diggCount ?? stats.likeCount ?? 0),
+        commentCount: BigInt(stats.commentCount ?? 0),
+        shareCount: BigInt(stats.shareCount ?? 0),
+        saveCount: BigInt(stats.collectCount ?? 0),
+        platformMeta: {
+          hashtags: (item.textExtra ?? [])
+            .filter((t: any) => t.hashtagName)
+            .map((t: any) => t.hashtagName as string),
+        },
       });
+    } catch {
+      // Individual video may be deleted/private — skip it
     }
   }
   return results;
 }
 
-// ─── Keyword/hashtag search ───────────────────────────────────────────────────
+// --- Keyword / hashtag search -----------------------------------------------
 
 export async function searchTikTok(query: string, opts: { max?: number } = {}): Promise<string[]> {
-  // Strip # for hashtag searches — the Research API uses the keyword without #
-  const keyword = query.replace(/^#/, "");
-  const data = await post("/v2/research/video/query/", {
-    query: { and: [{ operation: "IN", field_name: "hashtag_name", field_values: [keyword] }] },
-    start_date: formatDate(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)),
-    end_date: formatDate(new Date()),
-    max_count: Math.min(opts.max ?? 20, 100),
-    fields: ["id"],
-    sort_type: "1", // 1 = by popularity
-  });
-  await log("research/video/query");
-  return (data.data?.videos ?? []).map((v: any) => String(v.id));
-}
+  // For hashtag searches (#mm2), scrape the hashtag challenge page
+  const tag = query.replace(/^#/, "");
+  const data = await parsePageData(`https://www.tiktok.com/tag/${encodeURIComponent(tag)}`);
+  await log("scrape/tag/{hashtag}");
 
-function formatDate(d: Date): string {
-  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  const scope = data["__DEFAULT_SCOPE__"] ?? {};
+  // TikTok embeds the first page of challenge videos in the page data
+  const items: any[] =
+    scope["webapp.challenge-detail"]?.itemList ??
+    scope["seo.abtest"]?.itemList ??
+    [];
+
+  return items
+    .slice(0, opts.max ?? 20)
+    .map((item: any) => String(item.id))
+    .filter(Boolean);
 }
