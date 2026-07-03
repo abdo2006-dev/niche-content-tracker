@@ -55,7 +55,9 @@ export default function CreatorsPage() {
     const res = await fetch("/api/creators/" + id + "/sync", { method: "POST" });
     const d = await readResponse(res); setSyncing(null);
     if (!res.ok) { alert(d?.error ?? "Sync failed."); return; }
-    alert("Synced! " + (d?.created ?? 0) + " new post(s)."); load();
+    if ((d?.checked ?? 0) === 0) alert("Sync ran, but no public post list was available for this creator. TikTok may be hiding this account's video grid from server-side scraping.");
+    else alert("Synced " + (d?.checked ?? 0) + " recent post(s). " + (d?.created ?? 0) + " new post(s).");
+    load();
   }
   async function del(id: string, name: string) {
     if (!confirm("Delete \"" + name + "\" and all their tracked posts?")) return;
