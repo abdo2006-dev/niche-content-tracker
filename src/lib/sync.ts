@@ -23,9 +23,30 @@ async function saveNewPosts(posts: ResolvedPost[], creator: Creator): Promise<nu
   // Find which platformIds we already have
   const existing = await prisma.post.findMany({
     where: { platformId: { in: posts.map(p => p.platformId) } },
-    select: { platformId: true },
+    select: { id: true, platformId: true, creatorId: true },
   });
   const existingIds = new Set(existing.map(p => p.platformId));
+  const postsByPlatformId = new Map(posts.map(p => [p.platformId, p]));
+
+  for (const existingPost of existing) {
+    if (existingPost.creatorId && existingPost.creatorId !== creator.id) continue;
+    const d = postsByPlatformId.get(existingPost.platformId);
+    if (!d) continue;
+    await prisma.post.update({
+      where: { id: existingPost.id },
+      data: {
+        creatorId: creator.id,
+        viewCount: d.viewCount,
+        likeCount: d.likeCount,
+        commentCount: d.commentCount,
+        shareCount: d.shareCount,
+        saveCount: d.saveCount,
+        vph: calculateVph(d.viewCount, new Date(d.publishedAt)),
+        lastStatsUpdateAt: new Date(),
+      },
+    });
+  }
+
   const newPosts = posts.filter(p => !existingIds.has(p.platformId));
 
   if (!newPosts.length) return 0;

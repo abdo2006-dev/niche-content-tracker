@@ -27,17 +27,40 @@ const HEADERS = {
   Referer: "https://www.tikwm.com/",
 };
 
+const RECENT_LOOKBACK_DAYS = 14;
+let lastTikwmRequestAt = 0;
+
 async function log(endpoint: string) {
   try { await prisma.apiUsageLog.create({ data: { platform: "TIKTOK", endpoint, units: 1 } }); } catch {}
 }
 
-async function tikwm(path: string, params: Record<string, string>): Promise<any> {
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function tikwmRaw(path: string, params: Record<string, string>, attempt = 0): Promise<any> {
+  const waitMs = 1_100 - (Date.now() - lastTikwmRequestAt);
+  if (waitMs > 0) await sleep(waitMs);
+  lastTikwmRequestAt = Date.now();
+
   const url = new URL(`${BASE}${path}`);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await fetch(url.toString(), { headers: HEADERS });
   if (!res.ok) throw new Error(`tikwm.com request failed (HTTP ${res.status}). It may be temporarily down — try again shortly.`);
   const json = await res.json();
+
+  if (json?.code === -1 && typeof json?.msg === "string" && json.msg.includes("1 request/second")) {
+    if (attempt >= 1) throw new Error(`tikwm.com error: ${json.msg}`);
+    await sleep(1_200);
+    return tikwmRaw(path, params, attempt + 1);
+  }
+
   if (json.code !== 0) throw new Error(`tikwm.com error: ${json.msg ?? JSON.stringify(json)}`);
+  return json;
+}
+
+async function tikwm(path: string, params: Record<string, string>): Promise<any> {
+  const json = await tikwmRaw(path, params);
   return json.data;
 }
 
@@ -49,6 +72,74 @@ function parseUsername(input: string): string {
     if (parts[0]?.startsWith("@")) return parts[0].slice(1);
   } catch {}
   return t.replace(/^@/, "");
+}
+
+function cutoffDate(days = RECENT_LOOKBACK_DAYS) {
+  return new Date(Date.now() - days * 86_400_000);
+}
+
+function tikwmVideos(raw: any): any[] {
+  return Array.isArray(raw?.data?.videos) ? raw.data.videos : [];
+}
+
+function countBigInt(value: unknown, fallback: unknown = 0) {
+  const count = Number(value ?? fallback ?? 0);
+  return BigInt(Number.isFinite(count) ? Math.trunc(count) : 0);
+}
+
+function tikwmVideoToPost(v: any, username: string): ResolvedPost {
+  const authorHandle = v.author?.unique_id ?? v.author?.uniqueId ?? username;
+  const title = (v.title ?? v.desc ?? "").slice(0, 300);
+  return {
+    platform: "TIKTOK",
+    platformId: String(v.video_id ?? v.id),
+    title: title.slice(0, 200) || null,
+    description: title || null,
+    publishedAt: new Date((v.create_time ?? 0) * 1000).toISOString(),
+    thumbnailUrl: v.cover ?? v.ai_dynamic_cover ?? v.origin_cover ?? null,
+    durationSeconds: Number(v.duration ?? 0),
+    isShort: true,
+    url: `https://www.tiktok.com/@${authorHandle}/video/${v.video_id ?? v.id}`,
+    mediaType: "VIDEO",
+    viewCount: countBigInt(v.play_count),
+    likeCount: countBigInt(v.digg_count, v.like_count),
+    commentCount: countBigInt(v.comment_count),
+    shareCount: countBigInt(v.share_count),
+    saveCount: countBigInt(v.collect_count),
+    platformMeta: {
+      musicTitle: v.music_info?.title ?? null,
+      region: v.region ?? null,
+      isAd: v.is_ad ?? null,
+    },
+  };
+}
+
+export async function fetchTikwmUserPostsRaw(username: string, count = 5, cursor = "0") {
+  return tikwmRaw("/user/posts", {
+    unique_id: parseUsername(username),
+    count: String(Math.min(Math.max(count, 1), 35)),
+    cursor,
+  });
+}
+
+export function parseTikwmPosts(raw: any, max = 35): PostStub[] {
+  const cutoff = cutoffDate();
+  return tikwmVideos(raw)
+    .map((v: any): PostStub => ({
+      platformId: String(v.video_id ?? v.id),
+      publishedAt: new Date((v.create_time ?? 0) * 1000).toISOString(),
+      raw: v,
+    }))
+    .filter((stub: PostStub) => stub.platformId && new Date(stub.publishedAt) >= cutoff)
+    .slice(0, max);
+}
+
+export function parseTikwmPostsWithDetails(raw: any, username: string, max = 35): ResolvedPost[] {
+  const validIds = new Set(parseTikwmPosts(raw, max).map(stub => stub.platformId));
+  return tikwmVideos(raw)
+    .filter((v: any) => validIds.has(String(v.video_id ?? v.id)))
+    .slice(0, max)
+    .map((v: any) => tikwmVideoToPost(v, parseUsername(username)));
 }
 
 export async function resolveTikTokCreator(input: string): Promise<ResolvedCreator> {
@@ -72,16 +163,9 @@ export async function resolveTikTokCreator(input: string): Promise<ResolvedCreat
 }
 
 export async function fetchTikTokRecentPosts(username: string, max = 30): Promise<PostStub[]> {
-  const data = await tikwm("/user/posts", {
-    unique_id: username,
-    count: String(Math.min(max, 35)),
-    cursor: "0",
-  });
+  const raw = await fetchTikwmUserPostsRaw(username, max, "0");
   await log("user/posts");
-  return (data?.videos ?? []).map((v: any): PostStub => ({
-    platformId: String(v.video_id),
-    publishedAt: new Date((v.create_time ?? 0) * 1000).toISOString(),
-  }));
+  return parseTikwmPosts(raw, max);
 }
 
 export async function fetchTikTokPostDetails(videoIds: string[]): Promise<ResolvedPost[]> {
@@ -104,11 +188,11 @@ export async function fetchTikTokPostDetails(videoIds: string[]): Promise<Resolv
         isShort: true,
         url: `https://www.tiktok.com/@${authorHandle}/video/${v.id ?? id}`,
         mediaType: "VIDEO",
-        viewCount: BigInt(v.play ?? v.play_count ?? 0),
-        likeCount: BigInt(v.digg_count ?? v.like_count ?? 0),
-        commentCount: BigInt(v.comment_count ?? 0),
-        shareCount: BigInt(v.share_count ?? 0),
-        saveCount: BigInt(v.collect_count ?? 0),
+        viewCount: countBigInt(v.play_count),
+        likeCount: countBigInt(v.digg_count, v.like_count),
+        commentCount: countBigInt(v.comment_count),
+        shareCount: countBigInt(v.share_count),
+        saveCount: countBigInt(v.collect_count),
         platformMeta: {},
       });
       // Small pause — polite to the free service
@@ -143,34 +227,7 @@ export async function searchTikTok(query: string, opts: { max?: number } = {}): 
  * avoid a second per-video API call that would hit rate limits.
  */
 export async function fetchTikTokPostsWithDetails(username: string, max = 35): Promise<ResolvedPost[]> {
-  const data = await tikwm("/user/posts", {
-    unique_id: username,
-    count: String(Math.min(max, 35)),
-    cursor: "0",
-  });
+  const raw = await fetchTikwmUserPostsRaw(username, max, "0");
   await log("user/posts");
-
-  const videos: any[] = data?.videos ?? [];
-  return videos.map((v): ResolvedPost => {
-    const authorHandle = v.author?.unique_id ?? v.author?.uniqueId ?? username;
-    const dur = Number(v.duration ?? 0);
-    return {
-      platform: "TIKTOK" as const,
-      platformId: String(v.video_id),
-      title: (v.title ?? "").slice(0, 200) || null,
-      description: (v.title ?? "").slice(0, 300) || null,
-      publishedAt: new Date((v.create_time ?? 0) * 1000).toISOString(),
-      thumbnailUrl: v.cover ?? v.origin_cover ?? null,
-      durationSeconds: dur,
-      isShort: true,
-      url: `https://www.tiktok.com/@${authorHandle}/video/${v.video_id}`,
-      mediaType: "VIDEO" as const,
-      viewCount: BigInt(v.play ?? v.play_count ?? 0),
-      likeCount: BigInt(v.digg_count ?? v.like_count ?? 0),
-      commentCount: BigInt(v.comment_count ?? 0),
-      shareCount: BigInt(v.share_count ?? 0),
-      saveCount: BigInt(v.collect_count ?? 0),
-      platformMeta: {},
-    };
-  });
+  return parseTikwmPostsWithDetails(raw, username, max);
 }
