@@ -1,18 +1,15 @@
 /**
  * Core sync logic — platform-agnostic.
- * Dispatches to platform wrappers via src/lib/platforms/index.ts.
  */
 import { prisma } from "@/lib/prisma";
-import { fetchRecentPosts, fetchPostDetails } from "@/lib/platforms/index";
-import {
-  fetchInstagramRecentPosts,
-  fetchInstagramRecentPostsByUsername,
-} from "@/lib/platforms/instagram";
+import { fetchPostDetails } from "@/lib/platforms/index";
+import { fetchYouTubeRecentPosts, fetchYouTubePostDetails } from "@/lib/platforms/youtube";
+import { fetchTikTokPostsWithDetails } from "@/lib/platforms/tiktok";
+import { fetchInstagramRecentPosts, fetchInstagramRecentPostsByUsername, fetchInstagramPostDetails } from "@/lib/platforms/instagram";
 import { calculateVph, calculateGrowthSince } from "@/lib/metrics";
 import type { Creator, KeywordTracker } from "@prisma/client";
 import { searchPlatform } from "./platforms/index";
-
-const DEFAULT_CREATOR_SYNC_MAX_POSTS = 120;
+import type { ResolvedPost } from "./types";
 
 function chunks<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -20,99 +17,135 @@ function chunks<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-/** Sync new posts for a single creator. */
-export async function syncCreatorPosts(creator: Creator, max = DEFAULT_CREATOR_SYNC_MAX_POSTS) {
-  const meta = (creator.platformMeta ?? {}) as Record<string, unknown>;
-  let stubs;
+async function saveNewPosts(posts: ResolvedPost[], creator: Creator): Promise<number> {
+  if (!posts.length) return 0;
 
-  if (creator.platform === "INSTAGRAM") {
-    // Instagram: try by userId first (faster), fall back to username
+  // Find which platformIds we already have
+  const existing = await prisma.post.findMany({
+    where: { platformId: { in: posts.map(p => p.platformId) } },
+    select: { platformId: true },
+  });
+  const existingIds = new Set(existing.map(p => p.platformId));
+  const newPosts = posts.filter(p => !existingIds.has(p.platformId));
+
+  if (!newPosts.length) return 0;
+
+  const creatorTags = await prisma.creatorTag.findMany({
+    where: { creatorId: creator.id },
+    select: { tagId: true },
+  });
+
+  let created = 0;
+  for (const d of newPosts) {
+    try {
+      await prisma.post.upsert({
+        where: { platformId: d.platformId },
+        update: {
+          // On conflict, update stats in case a post was created without a creatorId
+          creatorId: creator.id,
+          viewCount: d.viewCount,
+          likeCount: d.likeCount,
+          commentCount: d.commentCount,
+          shareCount: d.shareCount,
+          saveCount: d.saveCount,
+          vph: calculateVph(d.viewCount, new Date(d.publishedAt)),
+          lastStatsUpdateAt: new Date(),
+        },
+        create: {
+          platform: d.platform,
+          platformId: d.platformId,
+          title: d.title,
+          description: d.description,
+          publishedAt: new Date(d.publishedAt),
+          thumbnailUrl: d.thumbnailUrl,
+          durationSeconds: d.durationSeconds,
+          isShort: d.isShort,
+          url: d.url,
+          mediaType: d.mediaType,
+          creatorId: creator.id,
+          viewCount: d.viewCount,
+          likeCount: d.likeCount,
+          commentCount: d.commentCount,
+          shareCount: d.shareCount,
+          saveCount: d.saveCount,
+          vph: calculateVph(d.viewCount, new Date(d.publishedAt)),
+          lastStatsUpdateAt: new Date(),
+          source: "CREATOR_SYNC",
+          platformMeta: d.platformMeta as any,
+          tags: { create: creatorTags.map(ct => ({ tagId: ct.tagId })) },
+          statsSnapshots: {
+            create: {
+              viewCount: d.viewCount,
+              likeCount: d.likeCount,
+              commentCount: d.commentCount,
+              shareCount: d.shareCount,
+              saveCount: d.saveCount,
+            },
+          },
+        },
+      });
+      created++;
+    } catch (err: any) {
+      console.warn(`saveNewPosts: failed to save ${d.platformId}: ${err.message}`);
+    }
+  }
+  return created;
+}
+
+/** Sync new posts for a single creator. Returns { checked, created }. */
+export async function syncCreatorPosts(creator: Creator, max = 35) {
+  const meta = (creator.platformMeta ?? {}) as Record<string, unknown>;
+  let posts: ResolvedPost[] = [];
+
+  // ── TikTok: single-pass via tikwm.com /user/posts ─────────────────────────
+  // tikwm's /user/posts already includes full stats — no separate detail call
+  // needed. This avoids rate-limit issues from per-video API requests.
+  if (creator.platform === "TIKTOK") {
+    const username = (meta.username as string | undefined)?.replace(/^@/, "") ?? creator.username.replace(/^@/, "");
+    posts = await fetchTikTokPostsWithDetails(username, max);
+  }
+
+  // ── YouTube: playlist fetch → batch details ───────────────────────────────
+  else if (creator.platform === "YOUTUBE") {
+    const playlistId = meta.uploadsPlaylistId as string | undefined;
+    if (!playlistId) throw new Error("YouTube creator has no uploads playlist ID in platformMeta.");
+    const stubs = await fetchYouTubeRecentPosts(playlistId, max);
+    for (const batch of chunks(stubs.map(s => s.platformId), 50)) {
+      const details = await fetchYouTubePostDetails(batch);
+      posts.push(...details);
+    }
+  }
+
+  // ── Instagram: userId feed → details ─────────────────────────────────────
+  else if (creator.platform === "INSTAGRAM") {
+    let stubs;
     try {
       stubs = await fetchInstagramRecentPosts(creator.platformId, max);
     } catch {
       const username = (meta.username as string | undefined)?.replace(/^@/, "");
-      if (!username) throw new Error("Instagram creator has no username in platformMeta");
+      if (!username) throw new Error("Instagram creator has no username in platformMeta.");
       stubs = await fetchInstagramRecentPostsByUsername(username, max);
     }
-  } else {
-    stubs = await fetchRecentPosts(creator.platform, meta, max);
-  }
-
-  const existing = await prisma.post.findMany({
-    where: { platformId: { in: stubs.map((s) => s.platformId) } },
-    select: { platformId: true },
-  });
-  const existingIds = new Set(existing.map((p) => p.platformId));
-  const newIds = stubs.filter((s) => !existingIds.has(s.platformId)).map((s) => s.platformId);
-
-  let created = 0;
-  if (newIds.length > 0) {
-    const creatorTags = await prisma.creatorTag.findMany({
-      where: { creatorId: creator.id },
-      select: { tagId: true },
-    });
-
-    const batchSize = creator.platform === "YOUTUBE" ? 50 : 10;
-    for (const batch of chunks(newIds, batchSize)) {
-      const details = await fetchPostDetails(creator.platform, batch);
-      for (const d of details) {
-        const vph = calculateVph(d.viewCount, new Date(d.publishedAt));
-        await prisma.post.upsert({
-          where: { platformId: d.platformId },
-          update: {},
-          create: {
-            platform: d.platform,
-            platformId: d.platformId,
-            title: d.title,
-            description: d.description,
-            publishedAt: new Date(d.publishedAt),
-            thumbnailUrl: d.thumbnailUrl,
-            durationSeconds: d.durationSeconds,
-            isShort: d.isShort,
-            url: d.url,
-            mediaType: d.mediaType,
-            creatorId: creator.id,
-            viewCount: d.viewCount,
-            likeCount: d.likeCount,
-            commentCount: d.commentCount,
-            shareCount: d.shareCount,
-            saveCount: d.saveCount,
-            vph,
-            lastStatsUpdateAt: new Date(),
-            source: "CREATOR_SYNC",
-            platformMeta: d.platformMeta as any,
-            tags: { create: creatorTags.map((ct) => ({ tagId: ct.tagId })) },
-            statsSnapshots: {
-              create: {
-                viewCount: d.viewCount,
-                likeCount: d.likeCount,
-                commentCount: d.commentCount,
-                shareCount: d.shareCount,
-                saveCount: d.saveCount,
-              },
-            },
-          },
-        });
-        created++;
-      }
+    for (const batch of chunks(stubs.map(s => s.platformId), 10)) {
+      const details = await fetchInstagramPostDetails(batch);
+      posts.push(...details);
     }
   }
 
-  const latestStub = stubs[0];
-  if (latestStub) {
-    await prisma.creator.update({
-      where: { id: creator.id },
-      data: {
-        lastSyncedAt: new Date(),
-        lastPostAt: new Date(latestStub.publishedAt),
-      },
-    });
-  }
+  const created = await saveNewPosts(posts, creator);
 
-  return { checked: stubs.length, created };
+  await prisma.creator.update({
+    where: { id: creator.id },
+    data: {
+      lastSyncedAt: new Date(),
+      lastPostAt: posts[0] ? new Date(posts[0].publishedAt) : creator.lastPostAt,
+    },
+  });
+
+  return { checked: posts.length, created };
 }
 
-/** Re-fetch stats for a list of post DB IDs and update snapshots + growth metrics. */
+/** Re-fetch and update stats for a list of post DB IDs. */
 export async function updatePostStats(postDbIds: string[]) {
   const posts = await prisma.post.findMany({ where: { id: { in: postDbIds } } });
   const byPlatform = new Map<string, typeof posts>();
@@ -126,69 +159,55 @@ export async function updatePostStats(postDbIds: string[]) {
   for (const [platform, group] of byPlatform) {
     const batchSize = platform === "YOUTUBE" ? 50 : 10;
     for (const batch of chunks(group, batchSize)) {
-      const details = await fetchPostDetails(platform as any, batch.map((p) => p.platformId));
-      const byPlatformId = new Map(details.map((d) => [d.platformId, d]));
+      try {
+        const details = await fetchPostDetails(platform as any, batch.map(p => p.platformId));
+        const byPlatformId = new Map(details.map(d => [d.platformId, d]));
 
-      for (const post of batch) {
-        const d = byPlatformId.get(post.platformId);
-        if (!d) continue;
+        for (const post of batch) {
+          const d = byPlatformId.get(post.platformId);
+          if (!d) continue;
+          const snapshots = await prisma.postStatsSnapshot.findMany({
+            where: { postId: post.id }, orderBy: { capturedAt: "asc" },
+          });
+          const vph = calculateVph(d.viewCount, post.publishedAt);
+          const viewsGained24h = calculateGrowthSince(d.viewCount, snapshots, 24);
+          const viewsGained7d = calculateGrowthSince(d.viewCount, snapshots, 168);
+          const viewsGained30d = calculateGrowthSince(d.viewCount, snapshots, 720);
 
-        const snapshots = await prisma.postStatsSnapshot.findMany({
-          where: { postId: post.id },
-          orderBy: { capturedAt: "asc" },
-        });
-
-        const vph = calculateVph(d.viewCount, post.publishedAt);
-        const viewsGained24h = calculateGrowthSince(d.viewCount, snapshots, 24);
-        const viewsGained7d = calculateGrowthSince(d.viewCount, snapshots, 168);
-        const viewsGained30d = calculateGrowthSince(d.viewCount, snapshots, 720);
-
-        await prisma.post.update({
-          where: { id: post.id },
-          data: {
-            viewCount: d.viewCount,
-            likeCount: d.likeCount,
-            commentCount: d.commentCount,
-            shareCount: d.shareCount,
-            saveCount: d.saveCount,
-            vph,
-            viewsGained24h,
-            viewsGained7d,
-            viewsGained30d,
-            lastStatsUpdateAt: new Date(),
-            statsSnapshots: {
-              create: {
-                viewCount: d.viewCount,
-                likeCount: d.likeCount,
-                commentCount: d.commentCount,
-                shareCount: d.shareCount,
-                saveCount: d.saveCount,
+          await prisma.post.update({
+            where: { id: post.id },
+            data: {
+              viewCount: d.viewCount, likeCount: d.likeCount,
+              commentCount: d.commentCount, shareCount: d.shareCount, saveCount: d.saveCount,
+              vph, viewsGained24h, viewsGained7d, viewsGained30d,
+              lastStatsUpdateAt: new Date(),
+              statsSnapshots: {
+                create: {
+                  viewCount: d.viewCount, likeCount: d.likeCount,
+                  commentCount: d.commentCount, shareCount: d.shareCount, saveCount: d.saveCount,
+                },
               },
             },
-          },
-        });
-        updated++;
+          });
+          updated++;
+        }
+      } catch (err: any) {
+        console.warn(`updatePostStats: batch failed for ${platform}: ${err.message}`);
       }
     }
   }
   return { updated };
 }
 
-/** Run or re-run a keyword tracker across its selected platforms. */
-export async function refreshKeywordTracker(
-  tracker: KeywordTracker & { platforms: any[] },
-  maxResults = 20
-) {
+/** Run a keyword tracker across its selected platforms. */
+export async function refreshKeywordTracker(tracker: KeywordTracker & { platforms: any[] }, maxResults = 20) {
   const allPostIds: string[] = [];
   let created = 0;
 
   for (const platform of tracker.platforms as any[]) {
     let platformIds: string[] = [];
     try {
-      platformIds = await searchPlatform(platform, tracker.query, {
-        shortsOnly: tracker.shortsOnly,
-        max: maxResults,
-      });
+      platformIds = await searchPlatform(platform, tracker.query, { shortsOnly: tracker.shortsOnly, max: maxResults });
     } catch (e: any) {
       console.warn(`Keyword search on ${platform} failed: ${e.message}`);
       continue;
@@ -198,51 +217,32 @@ export async function refreshKeywordTracker(
       where: { platformId: { in: platformIds } },
       select: { id: true, platformId: true },
     });
-    const existingByPlatformId = new Map(existing.map((p) => [p.platformId, p]));
-    const missing = platformIds.filter((id) => !existingByPlatformId.has(id));
+    const existingByPlatformId = new Map(existing.map(p => [p.platformId, p]));
+    const missing = platformIds.filter(id => !existingByPlatformId.has(id));
 
-    const batchSize = platform === "YOUTUBE" ? 50 : 10;
-    for (const batch of chunks(missing, batchSize)) {
+    for (const batch of chunks(missing, platform === "YOUTUBE" ? 50 : 10)) {
       const details = await fetchPostDetails(platform, batch);
       for (const d of details) {
-        const matchedCreator = await prisma.creator
-          .findUnique({
-            where: {
-              platform_platformId: { platform: d.platform, platformId: d.platformId.slice(0, 50) },
-            },
-          })
-          .catch(() => null);
-
+        const matchedCreator = await prisma.creator.findUnique({
+          where: { platform_platformId: { platform: d.platform, platformId: d.platformId.slice(0, 50) } },
+        }).catch(() => null);
         const saved = await prisma.post.upsert({
           where: { platformId: d.platformId },
           update: {},
           create: {
-            platform: d.platform,
-            platformId: d.platformId,
-            title: d.title,
-            description: d.description,
-            publishedAt: new Date(d.publishedAt),
-            thumbnailUrl: d.thumbnailUrl,
-            durationSeconds: d.durationSeconds,
-            isShort: d.isShort,
-            url: d.url,
-            mediaType: d.mediaType,
+            platform: d.platform, platformId: d.platformId, title: d.title,
+            description: d.description, publishedAt: new Date(d.publishedAt),
+            thumbnailUrl: d.thumbnailUrl, durationSeconds: d.durationSeconds,
+            isShort: d.isShort, url: d.url, mediaType: d.mediaType,
             creatorId: matchedCreator?.id ?? null,
-            viewCount: d.viewCount,
-            likeCount: d.likeCount,
-            commentCount: d.commentCount,
-            shareCount: d.shareCount,
-            saveCount: d.saveCount,
+            viewCount: d.viewCount, likeCount: d.likeCount,
+            commentCount: d.commentCount, shareCount: d.shareCount, saveCount: d.saveCount,
             vph: calculateVph(d.viewCount, new Date(d.publishedAt)),
-            lastStatsUpdateAt: new Date(),
-            source: "KEYWORD_SEARCH",
+            lastStatsUpdateAt: new Date(), source: "KEYWORD_SEARCH",
             statsSnapshots: {
               create: {
-                viewCount: d.viewCount,
-                likeCount: d.likeCount,
-                commentCount: d.commentCount,
-                shareCount: d.shareCount,
-                saveCount: d.saveCount,
+                viewCount: d.viewCount, likeCount: d.likeCount,
+                commentCount: d.commentCount, shareCount: d.shareCount, saveCount: d.saveCount,
               },
             },
           },
@@ -251,7 +251,7 @@ export async function refreshKeywordTracker(
         created++;
       }
     }
-    existing.forEach((p) => allPostIds.push(p.id));
+    existing.forEach(p => allPostIds.push(p.id));
   }
 
   for (const postId of [...new Set(allPostIds)]) {
@@ -262,10 +262,7 @@ export async function refreshKeywordTracker(
     });
   }
 
-  await prisma.keywordTracker.update({
-    where: { id: tracker.id },
-    data: { lastFetchedAt: new Date() },
-  });
+  await prisma.keywordTracker.update({ where: { id: tracker.id }, data: { lastFetchedAt: new Date() } });
   return { found: allPostIds.length, created };
 }
 

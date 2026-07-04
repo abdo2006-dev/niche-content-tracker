@@ -135,3 +135,42 @@ export async function searchTikTok(query: string, opts: { max?: number } = {}): 
     return [];
   }
 }
+
+// ─── Single-pass full sync (used by syncCreatorPosts) ─────────────────────
+/**
+ * Returns full ResolvedPost[] directly from /user/posts — the response already
+ * contains all stats (play count, likes, comments, shares, thumbnails) so we
+ * avoid a second per-video API call that would hit rate limits.
+ */
+export async function fetchTikTokPostsWithDetails(username: string, max = 35): Promise<ResolvedPost[]> {
+  const data = await tikwm("/user/posts", {
+    unique_id: username,
+    count: String(Math.min(max, 35)),
+    cursor: "0",
+  });
+  await log("user/posts");
+
+  const videos: any[] = data?.videos ?? [];
+  return videos.map((v): ResolvedPost => {
+    const authorHandle = v.author?.unique_id ?? v.author?.uniqueId ?? username;
+    const dur = Number(v.duration ?? 0);
+    return {
+      platform: "TIKTOK" as const,
+      platformId: String(v.video_id),
+      title: (v.title ?? "").slice(0, 200) || null,
+      description: (v.title ?? "").slice(0, 300) || null,
+      publishedAt: new Date((v.create_time ?? 0) * 1000).toISOString(),
+      thumbnailUrl: v.cover ?? v.origin_cover ?? null,
+      durationSeconds: dur,
+      isShort: true,
+      url: `https://www.tiktok.com/@${authorHandle}/video/${v.video_id}`,
+      mediaType: "VIDEO" as const,
+      viewCount: BigInt(v.play ?? v.play_count ?? 0),
+      likeCount: BigInt(v.digg_count ?? v.like_count ?? 0),
+      commentCount: BigInt(v.comment_count ?? 0),
+      shareCount: BigInt(v.share_count ?? 0),
+      saveCount: BigInt(v.collect_count ?? 0),
+      platformMeta: {},
+    };
+  });
+}
