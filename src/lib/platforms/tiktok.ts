@@ -21,6 +21,7 @@ import { prisma } from "@/lib/prisma";
 import type { ResolvedCreator, PostStub, ResolvedPost } from "@/lib/types";
 
 const BASE = "https://www.tikwm.com/api";
+const APIFY_TIKTOK_ACTOR = "clockworks/tiktok-scraper";
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
   Accept: "application/json",
@@ -46,8 +47,21 @@ async function tikwmRaw(path: string, params: Record<string, string>, attempt = 
   const url = new URL(`${BASE}${path}`);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await fetch(url.toString(), { headers: HEADERS });
-  if (!res.ok) throw new Error(`tikwm.com request failed (HTTP ${res.status}). It may be temporarily down — try again shortly.`);
-  const json = await res.json();
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
+
+  if (!res.ok) {
+    const challenged = text.includes("cf-mitigated") || text.includes("challenge-platform");
+    throw new Error(
+      challenged
+        ? `tikwm.com is blocked by Cloudflare for ${path} (HTTP ${res.status}).`
+        : `tikwm.com request failed (HTTP ${res.status}). It may be temporarily down — try again shortly.`
+    );
+  }
+  if (!json) throw new Error(`tikwm.com returned non-JSON for ${path}.`);
 
   if (json?.code === -1 && typeof json?.msg === "string" && json.msg.includes("1 request/second")) {
     if (attempt >= 1) throw new Error(`tikwm.com error: ${json.msg}`);
@@ -142,6 +156,105 @@ export function parseTikwmPostsWithDetails(raw: any, username: string, max = 35)
     .map((v: any) => tikwmVideoToPost(v, parseUsername(username)));
 }
 
+function apifyItemToPost(item: any, username: string): ResolvedPost | null {
+  const id = item.id ?? item.videoId ?? item.videoMeta?.id;
+  if (!id) return null;
+  const authorHandle = item.authorMeta?.name ?? username;
+  const title = String(item.text ?? item.description ?? "").slice(0, 300);
+  const publishedAt =
+    item.createTimeISO ??
+    (item.createTime ? new Date(Number(item.createTime) * 1000).toISOString() : new Date().toISOString());
+
+  return {
+    platform: "TIKTOK",
+    platformId: String(id),
+    title: title.slice(0, 200) || null,
+    description: title || null,
+    publishedAt,
+    thumbnailUrl:
+      item.videoMeta?.coverUrl ??
+      item.videoMeta?.originalCoverUrl ??
+      item.covers?.default ??
+      item.covers?.origin ??
+      null,
+    durationSeconds: Number(item.videoMeta?.duration ?? item.duration ?? 0),
+    isShort: true,
+    url: item.webVideoUrl ?? `https://www.tiktok.com/@${authorHandle}/video/${id}`,
+    mediaType: "VIDEO",
+    viewCount: countBigInt(item.playCount),
+    likeCount: countBigInt(item.diggCount),
+    commentCount: countBigInt(item.commentCount),
+    shareCount: countBigInt(item.shareCount),
+    saveCount: countBigInt(item.collectCount),
+    platformMeta: {
+      musicTitle: item.musicMeta?.musicName ?? null,
+      region: item.locationCreated ?? null,
+      isAd: item.isAd ?? null,
+      provider: "apify",
+    },
+  };
+}
+
+async function fetchApifyTikTokPostsWithDetails(username: string, max = 35): Promise<ResolvedPost[]> {
+  const token = process.env.APIFY_TOKEN;
+  if (!token) {
+    throw new Error(
+      "TikTok post sync is blocked: tikwm.com is Cloudflare-challenging video-list requests, and APIFY_TOKEN is not configured."
+    );
+  }
+
+  const actorId = process.env.APIFY_TIKTOK_ACTOR ?? APIFY_TIKTOK_ACTOR;
+  const actorPath = actorId.replace("/", "~");
+  const url = new URL(`https://api.apify.com/v2/acts/${actorPath}/run-sync-get-dataset-items`);
+  url.searchParams.set("token", token);
+  url.searchParams.set("memory", "1024");
+  url.searchParams.set("timeout", "120");
+  url.searchParams.set("clean", "true");
+
+  const profileUrl = `https://www.tiktok.com/@${parseUsername(username)}`;
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      excludePinnedPosts: false,
+      profiles: [profileUrl],
+      proxyCountryCode: "None",
+      resultsPerPage: Math.min(Math.max(max, 1), 35),
+      scrapeRelatedVideos: false,
+      shouldDownloadAvatars: false,
+      shouldDownloadCovers: false,
+      shouldDownloadMusicCovers: false,
+      shouldDownloadSlideshowImages: false,
+      shouldDownloadSubtitles: false,
+      shouldDownloadVideos: false,
+      profileScrapeSections: ["videos"],
+      profileSorting: "latest",
+      maxProfilesPerQuery: 1,
+    }),
+  });
+  await log("apify/tiktok-scraper");
+
+  const text = await res.text();
+  let json: any;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error(`Apify TikTok fallback returned non-JSON response (${res.status}).`);
+  }
+
+  if (!res.ok) {
+    const message = json?.error?.message ?? json?.message ?? text.slice(0, 200);
+    throw new Error(`Apify TikTok fallback failed (${res.status}): ${message}`);
+  }
+
+  const items = Array.isArray(json) ? json : [];
+  return items
+    .map((item) => apifyItemToPost(item, username))
+    .filter((post): post is ResolvedPost => Boolean(post))
+    .filter((post) => new Date(post.publishedAt) >= cutoffDate())
+    .slice(0, max);
+}
+
 export async function resolveTikTokCreator(input: string): Promise<ResolvedCreator> {
   const username = parseUsername(input);
   const data = await tikwm("/user/info/", { unique_id: username });
@@ -227,7 +340,17 @@ export async function searchTikTok(query: string, opts: { max?: number } = {}): 
  * avoid a second per-video API call that would hit rate limits.
  */
 export async function fetchTikTokPostsWithDetails(username: string, max = 35): Promise<ResolvedPost[]> {
-  const raw = await fetchTikwmUserPostsRaw(username, max, "0");
-  await log("user/posts");
-  return parseTikwmPostsWithDetails(raw, username, max);
+  try {
+    const raw = await fetchTikwmUserPostsRaw(username, max, "0");
+    await log("user/posts");
+    return parseTikwmPostsWithDetails(raw, username, max);
+  } catch (err: any) {
+    const message = String(err?.message ?? err);
+    const canFallback =
+      message.includes("Cloudflare") ||
+      message.includes("HTTP 403") ||
+      message.includes("non-JSON");
+    if (!canFallback) throw err;
+    return fetchApifyTikTokPostsWithDetails(username, max);
+  }
 }
