@@ -21,7 +21,7 @@ import { prisma } from "@/lib/prisma";
 import type { ResolvedCreator, PostStub, ResolvedPost } from "@/lib/types";
 
 const BASE = "https://www.tikwm.com/api";
-const APIFY_TIKTOK_ACTOR = "clockworks/tiktok-scraper";
+const APIFY_TIKTOK_ACTOR = "clockworks/tiktok-profile-scraper";
 const HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
   Accept: "application/json",
@@ -211,14 +211,13 @@ async function fetchApifyTikTokPostsWithDetails(username: string, max = 35): Pro
   url.searchParams.set("timeout", "120");
   url.searchParams.set("clean", "true");
 
-  const profileUrl = `https://www.tiktok.com/@${parseUsername(username)}`;
+  const cleanUsername = parseUsername(username);
   const res = await fetch(url.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       excludePinnedPosts: false,
-      profiles: [profileUrl],
-      proxyCountryCode: "None",
+      profiles: [cleanUsername],
       resultsPerPage: Math.min(Math.max(max, 1), 35),
       scrapeRelatedVideos: false,
       shouldDownloadAvatars: false,
