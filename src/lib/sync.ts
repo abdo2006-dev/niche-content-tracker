@@ -11,6 +11,14 @@ import type { Creator, KeywordTracker } from "@prisma/client";
 import { searchPlatform } from "./platforms/index";
 import type { ResolvedPost } from "./types";
 
+const DEFAULT_TIKTOK_SYNC_MAX = 10;
+
+function tikTokSyncMax(requestedMax: number) {
+  const configured = Number(process.env.TIKTOK_SYNC_MAX_POSTS ?? DEFAULT_TIKTOK_SYNC_MAX);
+  const cap = Number.isFinite(configured) && configured > 0 ? Math.trunc(configured) : DEFAULT_TIKTOK_SYNC_MAX;
+  return Math.min(requestedMax, cap);
+}
+
 function chunks<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -123,7 +131,7 @@ export async function syncCreatorPosts(creator: Creator, max = 35) {
   // needed. This avoids rate-limit issues from per-video API requests.
   if (creator.platform === "TIKTOK") {
     const username = (meta.username as string | undefined)?.replace(/^@/, "") ?? creator.username.replace(/^@/, "");
-    posts = await fetchTikTokPostsWithDetails(username, max);
+    posts = await fetchTikTokPostsWithDetails(username, tikTokSyncMax(max));
   }
 
   // ── YouTube: playlist fetch → batch details ───────────────────────────────
