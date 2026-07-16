@@ -11,7 +11,10 @@ export async function GET(req: NextRequest) {
   const intervalHours = Number(await getSetting("refreshInterval_statsUpdate")) || 2;
   const due = await prisma.post.findMany({
     where: { publishedAt: { gte: new Date(Date.now() - 30 * 86400000) }, OR: [{ lastStatsUpdateAt: null }, { lastStatsUpdateAt: { lte: new Date(Date.now() - intervalHours * 3600000) } }] },
-    select: { id: true }, take: 500,
+    orderBy: { publishedAt: "desc" },
+    select: { id: true },
+    take: 75,
   });
-  return NextResponse.json(await updatePostStats(due.map((p) => p.id)));
+  const result = await updatePostStats(due.map((p) => p.id));
+  return NextResponse.json({ ...result, checked: due.length });
 }

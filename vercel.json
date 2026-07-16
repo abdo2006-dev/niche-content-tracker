@@ -1,7 +1,7 @@
 {
   "crons": [
     { "path": "/api/cron/sync-creators",  "schedule": "0 1 * * *" },
-    { "path": "/api/cron/update-stats",   "schedule": "0 2 * * *" },
+    { "path": "/api/cron/update-stats",   "schedule": "0 * * * *" },
     { "path": "/api/cron/archive-trending","schedule": "0 4 * * *"  }
   ]
 }
