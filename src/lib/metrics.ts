@@ -3,6 +3,23 @@ export function calculateVph(viewCount: bigint, publishedAt: Date): number {
   return Number(viewCount) / hours;
 }
 
+function toBigIntCount(value: unknown): bigint {
+  if (typeof value === "bigint") return value;
+  const n = Number(value ?? 0);
+  return BigInt(Number.isFinite(n) ? Math.trunc(n) : 0);
+}
+
+export function withFreshVph<T extends { viewCount: unknown; publishedAt: Date | string; vph?: number | null }>(post: T) {
+  return {
+    ...post,
+    vph: calculateVph(toBigIntCount(post.viewCount), new Date(post.publishedAt)),
+  };
+}
+
+export function sortByFreshVph<T extends { viewCount: unknown; publishedAt: Date | string; vph?: number | null }>(posts: T[]) {
+  return posts.map(withFreshVph).sort((a, b) => b.vph - a.vph);
+}
+
 interface Snapshot { viewCount: bigint; capturedAt: Date; }
 
 export function calculateGrowthSince(current: bigint, snapshots: Snapshot[], targetHoursAgo: number): bigint {

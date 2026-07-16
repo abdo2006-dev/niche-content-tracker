@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { serializeBigInt } from "@/lib/serialize";
+import { sortByFreshVph, withFreshVph } from "@/lib/metrics";
 import type { Prisma } from "@prisma/client";
 
 export const dynamic = "force-dynamic";
@@ -36,12 +37,22 @@ export async function GET(req: NextRequest) {
     gained7d: { viewsGained7d: "desc" }, gained30d: { viewsGained30d: "desc" },
   } as any)[sort] ?? { publishedAt: "desc" };
 
-  const [posts, total] = await Promise.all([
-    prisma.post.findMany({
-      where, orderBy, skip: (page - 1) * pageSize, take: pageSize,
-      include: { creator: { select: { id: true, displayName: true, avatarUrl: true, platform: true } }, tags: { include: { tag: true } } },
-    }),
-    prisma.post.count({ where }),
-  ]);
+  const include = { creator: { select: { id: true, displayName: true, avatarUrl: true, platform: true } }, tags: { include: { tag: true } } };
+  const total = await prisma.post.count({ where });
+
+  if (sort === "vph") {
+    const candidates = await prisma.post.findMany({
+      where,
+      orderBy: { publishedAt: "desc" },
+      take: Math.min(2000, total),
+      include,
+    });
+    const posts = sortByFreshVph(candidates).slice((page - 1) * pageSize, page * pageSize);
+    return NextResponse.json(serializeBigInt({ posts, total, page, pageSize }));
+  }
+
+  const posts = (await prisma.post.findMany({
+    where, orderBy, skip: (page - 1) * pageSize, take: pageSize, include,
+  })).map(withFreshVph);
   return NextResponse.json(serializeBigInt({ posts, total, page, pageSize }));
 }
