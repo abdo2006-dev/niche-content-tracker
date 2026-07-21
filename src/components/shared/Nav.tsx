@@ -1,12 +1,13 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Users, FileVideo, TrendingUp, Lightbulb, Tag, Settings, ListChecks } from "lucide-react";
+import { LayoutDashboard, Users, FileVideo, TrendingUp, Lightbulb, Tag, Settings, ListChecks, BarChart3 } from "lucide-react";
 
 const links = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/creators", label: "Creators", icon: Users },
   { href: "/posts", label: "Posts", icon: FileVideo },
+  { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/todo", label: "To-Do Videos", icon: ListChecks },
   { href: "/trending", label: "Trending", icon: TrendingUp },
   { href: "/ideas", label: "Ideas", icon: Lightbulb },

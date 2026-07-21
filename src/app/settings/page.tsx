@@ -10,6 +10,7 @@ interface Settings {
   refreshInterval_keywordRefresh: string;
   maxPostsPerKeyword: string;
   maxTrendingDays: string;
+  postRetentionDays: string;
   cronEnabled: string;
 }
 
@@ -23,6 +24,7 @@ const FIELDS = [
   { key: "refreshInterval_keywordRefresh",label: "Keyword refresh interval (hours)",     min: 6,  max: 72,  hint: "YouTube search costs 100 quota units — keep at 12h+." },
   { key: "maxPostsPerKeyword",            label: "Max posts per keyword search",         min: 5,  max: 50,  hint: "How many posts to grab per keyword tracker run." },
   { key: "maxTrendingDays",              label: "Max trending age (days)",              min: 7,  max: 365, hint: "Posts older than this are archived from keyword trackers." },
+  { key: "postRetentionDays",             label: "Delete tracked posts after (days)",    min: 7,  max: 365, hint: "Old posts and their stats snapshots are deleted during the daily archive job." },
 ];
 
 export default function SettingsPage() {

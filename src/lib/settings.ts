@@ -6,6 +6,7 @@ export const DEFAULTS: Record<string, string> = {
   refreshInterval_keywordRefresh: "12",
   maxPostsPerKeyword: "20",
   maxTrendingDays: "30",
+  postRetentionDays: "30",
   cronEnabled: "true",
 };
 

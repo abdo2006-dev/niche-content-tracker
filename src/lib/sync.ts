@@ -309,3 +309,12 @@ export async function archiveExpiredTrackerPosts() {
   }
   return { archived };
 }
+
+export async function pruneOldPosts(retentionDays = 30) {
+  const days = Number.isFinite(retentionDays) && retentionDays >= 7 ? Math.trunc(retentionDays) : 30;
+  const cutoff = new Date(Date.now() - days * 86_400_000);
+  const result = await prisma.post.deleteMany({
+    where: { publishedAt: { lt: cutoff } },
+  });
+  return { deleted: result.count, retentionDays: days };
+}
