@@ -6,7 +6,7 @@ import TagSelector from "@/components/shared/TagSelector";
 import PlatformBadge from "@/components/shared/PlatformBadge";
 import { LoadingState, EmptyState } from "@/components/shared/States";
 import { formatNumber, formatRelativeTime } from "@/lib/format";
-import { RefreshCw, Trash2, Plus, X, Check, Zap } from "lucide-react";
+import { RefreshCw, Trash2, Plus, X, Check } from "lucide-react";
 import type { Platform } from "@prisma/client";
 
 const PLATFORMS = [
@@ -14,9 +14,6 @@ const PLATFORMS = [
   { value: "TIKTOK",    label: "TikTok",    hint: "Profile URL (tiktok.com/@name) or @username" },
   { value: "INSTAGRAM", label: "Instagram", hint: "Profile URL (instagram.com/name) or @username" },
 ];
-
-// How many hours old a sync can be before we auto-refresh on page visit
-const AUTO_SYNC_THRESHOLD_HOURS = 6;
 
 async function readResponse(res: Response) {
   const text = await res.text();
@@ -35,6 +32,7 @@ export default function CreatorsPage() {
   const [syncResults, setSyncResults] = useState<Record<string, string>>({});
   const [editingTagsFor, setEditingTagsFor] = useState<string | null>(null);
   const [editingTagIds, setEditingTagIds] = useState<string[]>([]);
+  const [syncingAll, setSyncingAll] = useState(false);
 
   const load = useCallback(() => {
     const p = new URLSearchParams({ sort, ...(filterPlatform && { platform: filterPlatform }) });
@@ -49,44 +47,6 @@ export default function CreatorsPage() {
   }, [sort, filterPlatform]);
 
   useEffect(() => { setLoading(true); load(); }, [load]);
-
-  // ── Auto-sync on page visit ────────────────────────────────────────────────
-  // After the creator list loads, check which ones haven't been synced
-  // recently and trigger background syncs silently. This way the data is
-  // always up-to-date without you having to click Sync manually.
-  useEffect(() => {
-    if (loading || creators.length === 0) return;
-    const stale = creators.filter(c => {
-      if (!c.lastSyncedAt) return true; // never synced
-      const hoursSince = (Date.now() - new Date(c.lastSyncedAt).getTime()) / 3_600_000;
-      return hoursSince >= AUTO_SYNC_THRESHOLD_HOURS;
-    });
-    if (stale.length === 0) return;
-
-    // Stagger background syncs so they don't all fire at once
-    stale.forEach((c, i) => {
-      setTimeout(() => {
-        setSyncing(prev => new Set([...prev, c.id]));
-        fetch(`/api/creators/${c.id}/sync?force=true`, { method: "POST" })
-          .then(readResponse)
-          .then(d => {
-            setSyncing(prev => { const s = new Set(prev); s.delete(c.id); return s; });
-            if (d && !d.error) {
-              setSyncResults(prev => ({
-                ...prev,
-                [c.id]: d.created > 0
-                  ? `+${d.created} new post${d.created !== 1 ? "s" : ""}`
-                  : "Up to date",
-              }));
-              if (d.created > 0) load(); // Refresh the list if new posts found
-            }
-          })
-          .catch(() => {
-            setSyncing(prev => { const s = new Set(prev); s.delete(c.id); return s; });
-          });
-      }, i * 1500); // 1.5s stagger between creators
-    });
-  }, [loading]); // Only run once after initial load
 
   async function sync(id: string) {
     setSyncing(prev => new Set([...prev, id]));
@@ -107,6 +67,29 @@ export default function CreatorsPage() {
     load();
   }
 
+  async function syncAll() {
+    if (!confirm("Auto sync all creators now? This can use YouTube quota and Apify credits for TikTok creators.")) return;
+    setSyncingAll(true);
+    setSyncResults({});
+    const res = await fetch("/api/creators/sync-all?force=true", { method: "POST" });
+    const d = await readResponse(res);
+    setSyncingAll(false);
+    if (!res.ok) {
+      setError(d?.error ?? "Auto sync all failed.");
+      return;
+    }
+    const next: Record<string, string> = {};
+    for (const row of d?.results ?? []) {
+      if (row.error) next[row.id] = `Error: ${row.error}`;
+      else if (row.skipped) next[row.id] = "Skipped";
+      else next[row.id] = row.created > 0
+        ? `+${row.created} new post${row.created !== 1 ? "s" : ""} (${row.checked} checked)`
+        : `Up to date (${row.checked} checked)`;
+    }
+    setSyncResults(next);
+    load();
+  }
+
   async function del(id: string, name: string) {
     if (!confirm(`Delete "${name}" and all their tracked posts?`)) return;
     await fetch(`/api/creators/${id}`, { method: "DELETE" });
@@ -123,8 +106,6 @@ export default function CreatorsPage() {
     load();
   }
 
-  const autoSyncingCount = syncing.size;
-
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -132,10 +113,10 @@ export default function CreatorsPage() {
           <h1 className="text-xl font-semibold text-white">Creators</h1>
           <p className="text-sm text-muted">
             {creators.length} tracked
-            {autoSyncingCount > 0 && (
+            {syncingAll && (
               <span className="ml-2 text-accent-green inline-flex items-center gap-1">
                 <RefreshCw size={11} className="animate-spin" />
-                Auto-syncing {autoSyncingCount}…
+                Auto-syncing all…
               </span>
             )}
           </p>
@@ -150,6 +131,10 @@ export default function CreatorsPage() {
             <option value="followers">Followers</option>
             <option value="name">Name</option>
           </select>
+          <button className="btn-secondary" onClick={syncAll} disabled={syncingAll}>
+            <RefreshCw size={15} className={syncingAll ? "animate-spin" : ""} />
+            Auto sync all
+          </button>
           <button className="btn-primary" onClick={() => setShowAdd(true)}>
             <Plus size={15} /> Add creator
           </button>

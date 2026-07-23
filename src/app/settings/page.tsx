@@ -54,7 +54,7 @@ export default function SettingsPage() {
 
   async function manualSync() {
     setSyncing(true); setMsg(null);
-    const res = await fetch("/api/creators/sync-all", { method: "POST" });
+    const res = await fetch("/api/creators/sync-all?force=true", { method: "POST" });
     const d = await res.json(); setSyncing(false);
     setMsg(`Synced ${d.results?.filter((r: any) => !r.skipped).length ?? 0} creator(s).`);
   }
@@ -83,7 +83,7 @@ export default function SettingsPage() {
           <StatusRow
             ok={settings.youtubeApiKeyConfigured}
             label="YouTube"
-            okText="YouTube Data API key configured — auto-sync enabled"
+            okText="YouTube Data API key configured"
             failText="YOUTUBE_API_KEY missing"
             failHint="Get a free key in 5 min: console.cloud.google.com → YouTube Data API v3 → Credentials → Create API Key. Needs only a Google account."
           />
@@ -114,7 +114,7 @@ export default function SettingsPage() {
         <label className="flex items-center gap-3 cursor-pointer">
           <input type="checkbox" checked={settings.cronEnabled === "true"}
             onChange={e => save("cronEnabled", String(e.target.checked))} className="w-4 h-4" />
-          <span className="text-sm text-muted">Enable scheduled sync (sync creators + update stats + archive trending)</span>
+          <span className="text-sm text-muted">Enable scheduled sync (daily creator sync + stats update + archive trending)</span>
         </label>
         <p className="text-xs text-muted/70">Schedules are in vercel.json. Disabling here stops them from doing work even if triggered.</p>
       </div>

@@ -31,33 +31,20 @@ export default function PostsPage() {
   const [keyword, setKeyword] = useState("");
   const [shortsOnly, setShortsOnly] = useState(false);
   const [debouncedKeyword, setDebouncedKeyword] = useState("");
-  const refreshedKeys = useRef(new Set<string>());
   const requestId = useRef(0);
 
   useEffect(()=>{ const t=setTimeout(()=>setDebouncedKeyword(keyword),350); return ()=>clearTimeout(t); },[keyword]);
   useEffect(()=>{ fetch("/api/tags").then(r=>r.json()).then(setTags).catch(()=>{}); fetch("/api/creators").then(r=>r.json()).then(setCreators).catch(()=>{}); },[]);
   useEffect(()=>setPage(1),[platform,sort,range,tagId,creatorId,debouncedKeyword,shortsOnly]);
 
-  const load = useCallback((refreshVisibleStats = true)=>{
+  const load = useCallback(()=>{
     const currentRequestId = ++requestId.current;
     setLoading(true);
     const p = new URLSearchParams({ sort, page:String(page), pageSize:"30", ...(platform&&{platform}), ...(range&&{range}), ...(tagId&&{tagId}), ...(creatorId&&{creatorId}), ...(debouncedKeyword&&{q:debouncedKeyword}), ...(shortsOnly&&{shortsOnly:"true"}) });
-    const key = p.toString();
     fetch("/api/posts?" + p).then(r=>r.json()).then(d=>{
       if (currentRequestId !== requestId.current) return;
       const loadedPosts = d.posts??[];
       setPosts(loadedPosts);setTotal(d.total??0);setLoading(false);
-      const ids = loadedPosts.map((post:any)=>post.id).filter(Boolean).slice(0,30);
-      if (!refreshVisibleStats || !ids.length || refreshedKeys.current.has(key)) return;
-      refreshedKeys.current.add(key);
-      fetch("/api/posts/stats-update", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({ ids }),
-      }).then(r=>r.ok?r.json():null).then(result=>{
-        if (currentRequestId !== requestId.current) return;
-        if (result?.updated > 0) load(false);
-      }).catch(()=>{});
     }).catch(()=>{if (currentRequestId === requestId.current) { setError("Failed.");setLoading(false); }});
   },[platform,sort,page,range,tagId,creatorId,debouncedKeyword,shortsOnly]);
   useEffect(()=>{load();},[load]);
